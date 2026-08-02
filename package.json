@@ -1,0 +1,19 @@
+{
+  "name": "sieve",
+  "private": true,
+  "packageManager": "bun@1.3.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "generate-types": "bun run --cwd packages/shared-types export-schema && bun run --cwd packages/shared-types generate"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0"
+  }
+}
