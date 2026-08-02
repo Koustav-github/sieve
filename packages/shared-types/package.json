@@ -1,0 +1,17 @@
+{
+  "name": "shared-types",
+  "private": true,
+  "version": "0.1.0",
+  "exports": {
+    ".": {
+      "types": "./src/api.d.ts"
+    }
+  },
+  "scripts": {
+    "export-schema": "cd ../../apps/server && uv run python -m app.export_openapi ../../packages/shared-types/openapi.json",
+    "generate": "openapi-typescript openapi.json -o src/api.d.ts"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.4.0"
+  }
+}
