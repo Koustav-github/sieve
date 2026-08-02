@@ -1,0 +1,29 @@
+# node
+node_modules/
+.next/
+.turbo/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+bun-debug.log*
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# env
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
+*.pem
+coverage/
+
+# generated (regenerate with `bun run generate-types`)
+packages/shared-types/openapi.json
