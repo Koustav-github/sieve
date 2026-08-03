@@ -35,7 +35,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: http://server:8000
+      API_URL: http://server:8000
+      NEXT_PUBLIC_API_URL: http://localhost:8000
     volumes:
       - ./apps/client/src:/repo/apps/client/src
     depends_on:
