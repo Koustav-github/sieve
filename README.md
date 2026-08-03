@@ -23,6 +23,15 @@ already be listening on `5432`. Container-to-container traffic between
 `server` and `db` still uses port `5432` internally — this only affects how
 you reach Postgres from the host, e.g. `psql -h localhost -p 5433 -U sieve`.
 
+The `ingest` service runs the Caspian message listener as its own process
+(separate from `server`, so an API reload never disrupts the live Caspian
+connection). It needs real Caspian credentials: copy `.env.example` to a
+root `.env` (gitignored) and fill in `CASPIAN_API_KEY`, `CASPIAN_BASE_URL`,
+`TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`. Unlike the rest of this file's
+hardcoded dev values, these four are read from that root `.env` via Docker
+Compose's built-in `${VAR}` substitution, since they're real secrets that
+must never be committed.
+
 **Option 2 — native:**
 
 ```bash

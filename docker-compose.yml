@@ -28,6 +28,23 @@ services:
       db:
         condition: service_healthy
 
+  ingest:
+    build:
+      context: ./apps/server
+    command: ["uv", "run", "python", "-m", "app.ingest.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://sieve:sieve@db:5432/sieve
+      CASPIAN_API_KEY: ${CASPIAN_API_KEY}
+      CASPIAN_BASE_URL: ${CASPIAN_BASE_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
+    volumes:
+      - ./apps/server/app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
   client:
     build:
       context: .
