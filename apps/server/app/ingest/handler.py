@@ -34,7 +34,11 @@ def build_on_message_handler(session_factory: Callable[[], Session]) -> Callable
             agent_id = _field(message, "agent_id", "identity")
             thread_id = _field(message, "thread_id")
             sender = getattr(message, "sender", None) or {}
-            sender_handle = sender.get("address") if isinstance(sender, dict) else None
+            # Extract sender handle with fallback keys for flexibility
+            if isinstance(sender, dict):
+                sender_handle = sender.get("address") or sender.get("email") or sender.get("handle")
+            else:
+                sender_handle = None
             text = _field(message, "text")
 
             if not (channel and agent_id and sender_handle):
@@ -67,7 +71,7 @@ def build_on_message_handler(session_factory: Callable[[], Session]) -> Callable
             db.commit()
         except Exception:
             db.rollback()
-            logger.exception("Failed to handle message %r", getattr(message, "id", None))
+            logger.exception("Failed to handle message %r", message_id)
         finally:
             db.close()
 

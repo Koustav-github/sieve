@@ -68,3 +68,24 @@ def test_message_missing_required_fields_is_dropped(session_factory):
         assert db.query(Message).filter_by(caspian_message_id="msg-104").count() == 0
     finally:
         db.close()
+
+
+def test_handler_catches_and_logs_exception_without_propagating(session_factory, monkeypatch):
+    import app.ingest.handler as handler_module
+
+    # Monkeypatch persist_message to raise an exception
+    def failing_persist_message(*args, **kwargs):
+        raise RuntimeError("Database failure")
+
+    monkeypatch.setattr(handler_module, "persist_message", failing_persist_message)
+
+    handle = build_on_message_handler(session_factory)
+    # This should NOT raise, even though persist_message fails
+    handle(_fake_message(id="msg-105"))
+
+    # Verify the message was NOT persisted (rolled back)
+    db = session_factory()
+    try:
+        assert db.query(Message).filter_by(caspian_message_id="msg-105").count() == 0
+    finally:
+        db.close()
