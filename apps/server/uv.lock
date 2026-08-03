@@ -48,6 +48,19 @@ wheels = [
 ]
 
 [[package]]
+name = "caspian-sdk"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3b/9a/0d60850aeea47948d1e49b65f1b9e426d4a193728a61184ea99dfb13639b/caspian_sdk-0.6.1.tar.gz", hash = "sha256:95351c4f52b45427f36f417430397db68eadb5228ec6ae2404ca085dc7f3951b", size = 23480, upload-time = "2026-07-29T12:12:28.172Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b5/91/f2d13bde02b7298313fcc0083937dcbaf82a6dcc6793bdd48f0cb8d510c8/caspian_sdk-0.6.1-py3-none-any.whl", hash = "sha256:107e25ec27753391c2ebf5301657d06b93b30ceb37336b7ec4faafe6d6537864", size = 19569, upload-time = "2026-07-29T12:12:26.881Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.7.22"
 source = { registry = "https://pypi.org/simple" }
@@ -617,6 +630,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
+    { name = "caspian-sdk" },
     { name = "fastapi" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-settings" },
@@ -634,6 +648,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.13.3" },
+    { name = "caspian-sdk", specifier = ">=0.6.1" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.3" },
     { name = "pydantic-settings", specifier = ">=2.6.0" },
