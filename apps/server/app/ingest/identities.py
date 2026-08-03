@@ -14,6 +14,25 @@ IDENTITY_CHANNELS: dict[str, list[str]] = {
     "internal": ["email", "slack", "discord"],
 }
 
+# KNOWN LIMITATION, live-verified against the real sandbox gateway (Task 9):
+# without customer_id/agent_id, `connect_email(username=...)` does NOT give
+# each identity its own mailbox on this project - the sandbox returned the
+# SAME existing connection/address for every username tried once one email
+# connection existed, so careers/support/internal's email presence collapses
+# onto one shared inbox. The properly-namespaced fix is Caspian's own
+# multi-tenant flow (one create_customer() + one create_agent() per identity,
+# then connect_email(customer_id=..., agent_id=...) - confirmed live to give
+# each identity a genuinely distinct address, e.g. careers@... vs
+# internal@...). That flow was NOT wired in here because create_customer()/
+# create_agent() are themselves not idempotent (confirmed live: repeat calls
+# mint new resources every time, not the same one back) - using them safely
+# needs the created customer_id/agent_id/connection_id persisted somewhere
+# that survives a worker restart, which is a real, separate piece of work
+# (e.g. a small table, or writing them to .env) deferred to a follow-up
+# rather than solved ad hoc here. Slack/Discord/Telegram are NOT affected -
+# they're already scoped per identity via separate bot tokens/webhooks, not
+# a shared name-uniqueness pool like email.
+
 # Sentinel stored in the results dict for a channel that came back 409 ("name
 # taken"): the gateway has confirmed this identity/channel is already
 # registered. That is the expected steady state from the second container
