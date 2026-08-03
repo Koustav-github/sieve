@@ -1,0 +1,1 @@
+1. Initiation of project is establised with dockerfiles and skeleton setup - Koustav
