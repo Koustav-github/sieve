@@ -4,7 +4,7 @@ from caspian_sdk import CommClient
 
 from app.db.session import SessionLocal
 from app.ingest.handler import build_on_message_handler
-from app.ingest.identities import register_identities
+from app.ingest.identities import connection_identity_map, register_identities
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,7 +29,9 @@ def main() -> None:
             "(see warnings above) - refusing to start listen()"
         )
 
-    client.on_message(build_on_message_handler(SessionLocal))
+    connection_identities = connection_identity_map(results)
+    logger.info("connection -> identity map: %r", connection_identities)
+    client.on_message(build_on_message_handler(SessionLocal, connection_identities))
     logger.info("Sieve ingestion worker listening...")
     client.listen()
 

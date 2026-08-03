@@ -8,12 +8,14 @@ from app.ingest.handler import build_on_message_handler
 from app.models.message import Message
 from app.models.person import PersonEntity
 
+CONNECTION_IDENTITIES = {"conn-support": "support", "conn-200": "support"}
+
 
 def _fake_message(**overrides):
     defaults = dict(
         id="msg-100",
         channel="email",
-        agent_id="support",
+        connection_id="conn-support",
         conversation_id=None,
         sender={"address": "customer@example.com"},
         text="Hello",
@@ -23,7 +25,7 @@ def _fake_message(**overrides):
 
 
 def test_handles_new_message_end_to_end(session_factory):
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message())
 
     db = session_factory()
@@ -39,7 +41,7 @@ def test_handles_new_message_end_to_end(session_factory):
 
 
 def test_duplicate_message_is_not_persisted_twice(session_factory):
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message(id="msg-101"))
     handle(_fake_message(id="msg-101"))
 
@@ -52,7 +54,7 @@ def test_duplicate_message_is_not_persisted_twice(session_factory):
 
 
 def test_known_sender_reuses_person_entity(session_factory):
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message(id="msg-102", sender={"address": "same@example.com"}))
     handle(_fake_message(id="msg-103", sender={"address": "same@example.com"}))
 
@@ -64,7 +66,7 @@ def test_known_sender_reuses_person_entity(session_factory):
 
 
 def test_message_missing_required_fields_is_dropped(session_factory):
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message(id="msg-104", sender={}))
 
     db = session_factory()
@@ -83,7 +85,7 @@ def test_handler_catches_and_logs_exception_without_propagating(session_factory,
 
     monkeypatch.setattr(handler_module, "persist_message", failing_persist_message)
 
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     # This should NOT raise, even though persist_message fails
     handle(_fake_message(id="msg-105"))
 
@@ -106,7 +108,7 @@ def test_handler_treats_integrity_error_as_expected_race(session_factory, monkey
 
     monkeypatch.setattr(handler_module, "persist_message", failing_persist_message)
 
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     with caplog.at_level(logging.WARNING, logger="app.ingest.handler"):
         handle(_fake_message(id="msg-106"))
 
@@ -125,7 +127,7 @@ def test_handler_treats_integrity_error_as_expected_race(session_factory, monkey
 
 def test_thread_id_reads_conversation_id_primary(session_factory):
     """I1: the real caspian_sdk.Message has `conversation_id`, not `thread_id`."""
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message(id="msg-107", conversation_id="conv-77"))
 
     db = session_factory()
@@ -139,7 +141,7 @@ def test_thread_id_reads_conversation_id_primary(session_factory):
 def test_thread_id_falls_back_to_thread_id_attr(session_factory):
     """I1: `thread_id` remains a fallback for robustness against simpler fakes
     that don't set `conversation_id` at all."""
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message(id="msg-108", thread_id="legacy-thread-9"))
 
     db = session_factory()
@@ -154,7 +156,7 @@ def test_raw_payload_includes_full_real_message_fields(session_factory):
     """I2: raw_payload must be built from the real caspian_sdk.Message dataclass
     fields (subject, html, media, ids, ...), not a hand-picked subset -
     `subject` in particular is the primary bucketing signal for classification."""
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     caspian_message = CaspianMessage(
         id="msg-200",
         conversation_id="conv-200",
@@ -194,7 +196,7 @@ def test_raw_payload_includes_full_real_message_fields(session_factory):
 def test_raw_payload_falls_back_to_vars_for_non_dataclass_fake(session_factory):
     """I2: the fallback path must still work for the simple SimpleNamespace
     fakes used elsewhere in this file, which aren't real dataclasses."""
-    handle = build_on_message_handler(session_factory)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES)
     handle(_fake_message(id="msg-201"))
 
     db = session_factory()

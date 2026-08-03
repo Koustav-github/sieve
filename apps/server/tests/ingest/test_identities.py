@@ -1,7 +1,11 @@
 from caspian_sdk import CommError
 
 from app.core.config import settings
-from app.ingest.identities import ALREADY_REGISTERED, register_identities
+from app.ingest.identities import (
+    ALREADY_REGISTERED,
+    connection_identity_map,
+    register_identities,
+)
 
 
 class _FakeClient:
@@ -49,6 +53,52 @@ def test_register_identities_returns_connections_on_success(monkeypatch):
     assert results[("support", "telegram")] == {"id": "conn-telegram", "status": "active"}
     assert results[("internal", "slack")] == {"id": "conn-slack", "status": "active"}
     assert results[("internal", "discord")] == {"id": "conn-discord", "status": "active"}
+
+
+def test_register_identities_never_passes_agent_id_or_customer_id(monkeypatch):
+    """Live sandbox correction: agent_id requires a paired customer_id from
+    Caspian's multi-tenant create_customer()/create_agent() flow (422
+    otherwise) - Sieve doesn't do multi-tenant isolation, so neither is
+    passed on any of the 4 connect_*/install_* calls."""
+    monkeypatch.setattr(settings, "telegram_bot_token", "tg-token")
+    monkeypatch.setattr(settings, "discord_bot_token", "dc-token")
+
+    client = _FakeClient()
+    register_identities(client)
+
+    for _channel, kwargs in client.calls:
+        assert "agent_id" not in kwargs
+        assert "customer_id" not in kwargs
+
+
+def test_connection_identity_map_extracts_ids_from_successful_results():
+    results = {
+        ("careers", "email"): {"id": "conn-careers-email", "status": "active"},
+        ("support", "email"): {"id": "conn-support-email", "status": "active"},
+        ("support", "telegram"): {"id": "conn-support-telegram", "status": "active"},
+    }
+
+    mapping = connection_identity_map(results)
+
+    assert mapping == {
+        "conn-careers-email": "careers",
+        "conn-support-email": "support",
+        "conn-support-telegram": "support",
+    }
+
+
+def test_connection_identity_map_skips_non_dict_results():
+    """A 409 (ALREADY_REGISTERED) or None (skipped/failed) result contributes
+    no connection_id - there's nothing to map."""
+    results = {
+        ("careers", "email"): ALREADY_REGISTERED,
+        ("support", "telegram"): None,
+        ("internal", "slack"): {"id": "conn-internal-slack", "status": "pending_oauth"},
+    }
+
+    mapping = connection_identity_map(results)
+
+    assert mapping == {"conn-internal-slack": "internal"}
 
 
 def test_register_identities_treats_409_as_non_fatal_and_continues(monkeypatch):

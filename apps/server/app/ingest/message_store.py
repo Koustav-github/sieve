@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -31,7 +31,7 @@ def persist_message(
         sender_handle=sender_handle,
         thread_id=thread_id,
         raw_payload=raw_payload,
-        received_at=datetime.now(timezone.utc),
+        received_at=datetime.now(UTC),
     )
     db.add(message)
     db.flush()

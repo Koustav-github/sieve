@@ -35,12 +35,18 @@ def register_identities(client: CommClient) -> dict[tuple[str, str], dict | str 
                            human-facing name for a shared-app install.
       - connect_discord:  HAS `username=` (webhook-based per-agent name).
 
-    The one parameter present on all four methods is `agent_id=`, which
-    is the platform's actual mechanism for associating a channel
-    connection with one of Sieve's fixed identities. We pass
-    `agent_id=identity` on every call, and additionally pass
-    `username=`/`display_name=` where the channel supports a human-facing
-    name.
+    LIVE-VERIFIED CORRECTION (Task 9 smoke test against the real sandbox
+    gateway): `agent_id=` is NOT a free-form label. The gateway rejected
+    every `agent_id=identity` call with `422: Provide both customer_id and
+    agent_id, or neither` - `agent_id` is only valid when paired with a
+    `customer_id` from Caspian's multi-tenant `create_customer()`/
+    `create_agent()` resource flow (see the SDK's own multi-tenant example).
+    Sieve is a single organisation running 3 fixed identities, not a
+    multi-tenant platform serving multiple customers, so that flow doesn't
+    apply here - we pass NEITHER `customer_id` nor `agent_id`. Identity is
+    instead distinguished purely by `username=`/bot token/`display_name=`
+    per channel (the "same agent across channels with unique identity"
+    pattern from the SDK's docs), which is exactly what Sieve needs.
 
     Idempotency / fault tolerance (final-review C1 fix): this function is
     called on every container start, including every crash-loop restart
@@ -59,17 +65,25 @@ def register_identities(client: CommClient) -> dict[tuple[str, str], dict | str 
     the process as a whole; this function never raises for a per-channel
     failure so it always finishes and lets the worker reach `client.listen()`.
 
-    ASSUMPTION requiring live verification (I3, deferred to Task 9): we
-    assume the `agent_id` string passed on every connect_*/install_* call
-    below is exactly what the gateway echoes back on inbound events, i.e.
-    that `caspian_sdk.client.Message.agent_id` on a real inbound message
-    equals the literal `identity` string ("careers"/"support"/"internal") we
-    registered it under here. `app/ingest/handler.py` relies on this for its
-    coarse-bucket semantic (`messages.agent_id` must be exactly one of those
-    three values). This cannot be confirmed without a live gateway and real
-    credentials, which this task does not have - do not assume it is true in
-    production until Task 9 verifies it end-to-end against the real Caspian
-    gateway.
+    COARSE-BUCKET NOTE (I3, resolved by the correction above): since we no
+    longer send `agent_id` at all, `app/ingest/handler.py` cannot rely on
+    `caspian_sdk.client.Message.agent_id` to carry Sieve's identity label -
+    the live sandbox confirmed the gateway assigns its OWN platform-internal
+    agent_id (e.g. "agt_a6cdd09cd6d882a26aaa72a2") even when we don't set
+    one, unrelated to our "careers"/"support"/"internal" labels. Instead,
+    `handler.py` resolves the coarse bucket from `Message.connection_id` via
+    `connection_identity_map()` below, built from THIS function's own
+    return value.
+
+    Idempotency was also verified live: calling e.g. `connect_email(
+    username="careers")` twice (without `agent_id`/`customer_id`) returns
+    the *same* connection `id` both times, not a 409 - so
+    `connection_identity_map()` can rebuild a correct, complete mapping
+    fresh on every worker boot from this function's return value alone;
+    nothing needs to be persisted. The `ALREADY_REGISTERED`/409 handling
+    below is kept as a defensive fallback for a genuine external conflict
+    (e.g. the same name legitimately taken by a different, unrelated
+    Caspian account), which the live test did not encounter.
 
     Returns a dict of ``{(identity, channel): result}`` where ``result`` is:
       - the connection dict returned by the gateway on success,
@@ -87,7 +101,7 @@ def register_identities(client: CommClient) -> dict[tuple[str, str], dict | str 
         if "email" in channels:
             results[(identity, "email")] = _register_channel(
                 identity, "email",
-                partial(client.connect_email, username=identity, agent_id=identity),
+                partial(client.connect_email, username=identity),
             )
         if "telegram" in channels:
             if not settings.telegram_bot_token:
@@ -99,18 +113,12 @@ def register_identities(client: CommClient) -> dict[tuple[str, str], dict | str 
             else:
                 results[(identity, "telegram")] = _register_channel(
                     identity, "telegram",
-                    partial(
-                        client.connect_telegram,
-                        bot_token=settings.telegram_bot_token, agent_id=identity,
-                    ),
+                    partial(client.connect_telegram, bot_token=settings.telegram_bot_token),
                 )
         if "slack" in channels:
             results[(identity, "slack")] = _register_channel(
                 identity, "slack",
-                partial(
-                    client.install_slack,
-                    agent_id=identity, display_name=f"Sieve ({identity})",
-                ),
+                partial(client.install_slack, display_name=f"Sieve ({identity})"),
             )
         if "discord" in channels:
             if not settings.discord_bot_token:
@@ -126,11 +134,33 @@ def register_identities(client: CommClient) -> dict[tuple[str, str], dict | str 
                         client.connect_discord,
                         bot_token=settings.discord_bot_token,
                         username=identity,
-                        agent_id=identity,
                     ),
                 )
 
     return results
+
+
+def connection_identity_map(
+    results: dict[tuple[str, str], dict | str | None],
+) -> dict[str, str]:
+    """Build a `connection_id -> identity` map from `register_identities`'s
+    return value, so `handler.py` can resolve which of Sieve's 3 identities
+    an inbound `Message` belongs to via `Message.connection_id` (see
+    `register_identities`'s docstring for why `Message.agent_id` can't be
+    used for this).
+
+    Rebuilt fresh from the live return value on every worker boot - no
+    persistence needed, since registration was verified idempotent (see
+    `register_identities`'s docstring). A channel whose result is
+    `ALREADY_REGISTERED` or `None` (a genuine conflict, or blank secret)
+    contributes nothing here; messages arriving on that connection won't
+    resolve to an identity until it registers successfully.
+    """
+    return {
+        result["id"]: identity
+        for (identity, _channel), result in results.items()
+        if isinstance(result, dict) and "id" in result
+    }
 
 
 def _register_channel(identity: str, channel: str, connect: Callable[[], dict]) -> dict | str | None:

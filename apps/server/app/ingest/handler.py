@@ -43,7 +43,19 @@ def _raw_payload(message: Any) -> dict[str, Any]:
     return {key: value for key, value in data.items() if not key.startswith("_")}
 
 
-def build_on_message_handler(session_factory: Callable[[], Session]) -> Callable[[Any], None]:
+def build_on_message_handler(
+    session_factory: Callable[[], Session],
+    connection_identities: dict[str, str],
+) -> Callable[[Any], None]:
+    """`connection_identities` maps a Caspian `connection_id` to one of
+    Sieve's 3 fixed identities ("careers"/"support"/"internal") - see
+    `app.ingest.identities.connection_identity_map`. The real
+    `caspian_sdk.client.Message.agent_id` is Caspian's own platform-internal
+    id (assigned even when we don't request one) and is NOT one of Sieve's
+    identity labels, so it cannot be used as the coarse bucket - the
+    connection the message arrived on is the only reliable signal.
+    """
+
     def handle(message: Any) -> None:
         db = session_factory()
         message_id = None
@@ -57,7 +69,8 @@ def build_on_message_handler(session_factory: Callable[[], Session]) -> Callable
                 return
 
             channel = _field(message, "channel")
-            agent_id = _field(message, "agent_id")
+            connection_id = _field(message, "connection_id")
+            agent_id = connection_identities.get(connection_id) if connection_id else None
             # The real caspian_sdk.Message has no `thread_id` - the field is
             # `conversation_id`. Keep `thread_id` as a secondary fallback for
             # robustness against the simpler fake message objects tests use.
