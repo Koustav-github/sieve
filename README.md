@@ -10,9 +10,15 @@ Monorepo: Next.js frontend (`apps/client`) + FastAPI backend (`apps/server`), or
 docker compose up
 ```
 
-No `.env` file is needed — `docker-compose.yml` hardcodes all environment
-values directly (there's no `env_file:` or `${VAR}` substitution), so a root
-`.env` has zero effect on this path.
+`db`, `server`, and `client` need no `.env` file — `docker-compose.yml`
+hardcodes all of their environment values directly (there's no `env_file:`
+or `${VAR}` substitution on those three services), so a root `.env` has zero
+effect on them. The `ingest` service is the exception - see below.
+
+A one-shot `migrate` service runs `alembic upgrade head` before `server` and
+`ingest` start (they both `depends_on: migrate: condition:
+service_completed_successfully`), so a fresh `docker compose up` gets a
+database with tables with no manual step.
 
 - Client: http://localhost:3000
 - Server: http://localhost:8000 (docs at /docs)
@@ -31,6 +37,21 @@ root `.env` (gitignored) and fill in `CASPIAN_API_KEY`, `CASPIAN_BASE_URL`,
 hardcoded dev values, these four are read from that root `.env` via Docker
 Compose's built-in `${VAR}` substitution, since they're real secrets that
 must never be committed.
+
+If you're not working on ingestion (e.g. a frontend dev doing `docker
+compose up` with no root `.env` at all), `db`, `server`, and `client` come up
+fine regardless. `ingest` will still fail fast: with no `CASPIAN_API_KEY` at
+all, `CommClient()` itself raises before the process gets anywhere near
+`register_identities()` or `listen()` - there's no valid way to run the
+Caspian listener without a real key, so this is expected, not a bug. Thanks
+to the `register_identities()` fix that made per-channel registration
+failures (and blank bot tokens) non-fatal, `ingest` crash-looping (`restart:
+unless-stopped`) is now scoped to "no/invalid `CASPIAN_API_KEY`" rather than
+also happening on ordinary restarts (previously any transient 409 or blank
+token would crash-loop it too). It does not affect `server`/`client`/`db` -
+they don't depend on `ingest` and keep working normally. If `ingest`'s
+crash-loop noise bothers you and you're not touching ingestion, run `docker
+compose up server client db` instead of `docker compose up`.
 
 **Option 2 — native:**
 

@@ -15,6 +15,16 @@ services:
       timeout: 5s
       retries: 5
 
+  migrate:
+    build:
+      context: ./apps/server
+    command: ["uv", "run", "alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://sieve:sieve@db:5432/sieve
+    depends_on:
+      db:
+        condition: service_healthy
+
   server:
     build:
       context: ./apps/server
@@ -27,6 +37,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   ingest:
     build:
@@ -43,6 +55,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   client:
