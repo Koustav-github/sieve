@@ -1,6 +1,7 @@
 import type { paths } from "shared-types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_URL =
+  process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export type HealthResponse =
   paths["/health"]["get"]["responses"][200]["content"]["application/json"];

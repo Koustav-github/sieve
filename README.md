@@ -7,9 +7,12 @@ Monorepo: Next.js frontend (`apps/client`) + FastAPI backend (`apps/server`), or
 **Option 1 — Docker Compose (recommended):**
 
 ```bash
-cp .env.example .env
 docker compose up
 ```
+
+No `.env` file is needed — `docker-compose.yml` hardcodes all environment
+values directly (there's no `env_file:` or `${VAR}` substitution), so a root
+`.env` has zero effect on this path.
 
 - Client: http://localhost:3000
 - Server: http://localhost:8000 (docs at /docs)
@@ -27,7 +30,12 @@ bun install
 bunx turbo dev
 ```
 
-Requires `uv` installed locally and a Postgres instance matching `DATABASE_URL` in `.env`.
+Requires `uv` installed locally and a Postgres instance matching `DATABASE_URL`.
+If you want to override the built-in defaults, copy `.env.example` to
+`apps/server/.env` — that's where FastAPI's settings loader looks (it reads
+`.env` relative to `apps/server`, which is the working directory Turborepo
+runs the server's `dev` script from), not a root-level `.env`. Likewise,
+Next.js only reads `.env*` files from `apps/client/`, not the repo root.
 
 ## Regenerating shared API types
 
