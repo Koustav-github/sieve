@@ -174,12 +174,66 @@ def connection_identity_map(
     `ALREADY_REGISTERED` or `None` (a genuine conflict, or blank secret)
     contributes nothing here; messages arriving on that connection won't
     resolve to an identity until it registers successfully.
+
+    Raises `ValueError` if two different identities resolve to the same
+    `connection_id` instead of silently letting the later one win - this is
+    the exact shape of the live-observed sandbox bug (see the KNOWN
+    LIMITATION note above): careers/email and internal/email both landing on
+    one shared connection, which would otherwise silently misroute all of
+    the losing identity's inbound mail to the winner.
     """
-    return {
-        result["id"]: identity
-        for (identity, _channel), result in results.items()
-        if isinstance(result, dict) and "id" in result
-    }
+    mapping: dict[str, str] = {}
+    for (identity, _channel), result in results.items():
+        if not (isinstance(result, dict) and "id" in result):
+            continue
+        connection_id = result["id"]
+        existing_identity = mapping.get(connection_id)
+        if existing_identity is not None and existing_identity != identity:
+            raise ValueError(
+                f"connection_id {connection_id!r} resolved to both "
+                f"{existing_identity!r} and {identity!r} - Caspian returned "
+                "the same connection for two different Sieve identities "
+                "(see the KNOWN LIMITATION note in this module); refusing "
+                "to build an ambiguous connection -> identity mapping"
+            )
+        mapping[connection_id] = identity
+    return mapping
+
+
+def validate_identity_coverage(
+    results: dict[tuple[str, str], dict | str | None],
+    connection_map: dict[str, str],
+) -> None:
+    """Fail loudly if any identity that requires "email" (currently all 3 -
+    see `IDENTITY_CHANNELS`) does not have exactly one resolved connection_id
+    in `connection_map`.
+
+    An `ALREADY_REGISTERED` (409) result is treated as unusable here, not as
+    success: we don't retrieve the existing connection's id from the
+    gateway (that would need a separate lookup call this module doesn't
+    make - see the KNOWN LIMITATION note), so a 409'd email identity has no
+    way to route inbound mail until it registers cleanly. Call this once at
+    worker startup, after `connection_identity_map`, and let the
+    `RuntimeError` propagate to stop the worker before `client.listen()` -
+    starting up with incomplete email coverage means silently dropping or
+    misrouting mail for whichever identity is missing.
+    """
+    unresolved = [
+        identity
+        for identity, channels in IDENTITY_CHANNELS.items()
+        if "email" in channels
+        and not (
+            isinstance(results.get((identity, "email")), dict)
+            and results[(identity, "email")]["id"] in connection_map
+            and connection_map[results[(identity, "email")]["id"]] == identity
+        )
+    ]
+    if unresolved:
+        raise RuntimeError(
+            "Incomplete email identity coverage - no resolved connection_id "
+            f"mapping for: {unresolved}. Refusing to start listen() with "
+            "identities that cannot reliably route inbound email."
+        )
 
 
 def _register_channel(identity: str, channel: str, connect: Callable[[], dict]) -> dict | str | None:
