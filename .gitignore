@@ -24,6 +24,7 @@ __pycache__/
 .DS_Store
 *.pem
 coverage/
+.worktrees/
 
 # generated (regenerate with `bun run generate-types`)
 packages/shared-types/openapi.json
