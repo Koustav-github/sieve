@@ -107,15 +107,18 @@ def build_on_message_handler(
         except IntegrityError:
             # Caspian's listen() can dispatch different conversations
             # concurrently, so two first-contact messages from the same new
-            # sender can race on the channel_handles unique constraint. The
+            # sender can race on the channel_handles unique constraint - or a
+            # redelivery can slip past the is_duplicate() check above and
+            # race on messages.caspian_message_id instead. Either way the
             # loser here is a valid message, not a bug - log it distinctly
             # (no traceback) and treat it as "already processed" by dropping
             # it, rather than as a crash-worthy failure.
             db.rollback()
             logger.warning(
-                "IntegrityError persisting message %s; likely a concurrent "
-                "sender/dedup race on channel_handles - treating as already "
-                "processed and dropping",
+                "IntegrityError persisting message %s; likely a duplicate "
+                "delivery race on messages.caspian_message_id or a "
+                "concurrent sender-resolution race on channel_handles - "
+                "treating as already processed and dropping",
                 message_id,
             )
         except Exception:

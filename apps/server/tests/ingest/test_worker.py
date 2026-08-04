@@ -18,15 +18,20 @@ class _FakeClient:
 
 def test_main_reaches_listen_with_partial_registration_failures(monkeypatch):
     """C1: main() must always reach client.listen() when at least one channel
-    registered successfully, regardless of other channels' outcomes."""
+    registered successfully, regardless of other channels' outcomes - as long
+    as every identity's *email* coverage (the required-for-all-3 channel) is
+    still fully resolved. Here support's telegram fails but all 3 identities'
+    email registrations succeed, so listen() must still be reached."""
     fake_client = _FakeClient()
     monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
         lambda client: {
-            ("careers", "email"): {"id": "conn-1"},
-            ("support", "email"): None,
+            ("careers", "email"): {"id": "conn-careers-email"},
+            ("support", "email"): {"id": "conn-support-email"},
+            ("support", "telegram"): None,
+            ("internal", "email"): {"id": "conn-internal-email"},
         },
     )
 
@@ -56,22 +61,28 @@ def test_main_raises_when_every_channel_fails(monkeypatch):
     assert fake_client.listen_called is False
 
 
-def test_main_reaches_listen_when_results_empty(monkeypatch):
-    """Defensive: an empty results dict must not be treated as 'every channel
-    failed' (there's nothing to have failed)."""
+def test_main_raises_when_results_empty(monkeypatch):
+    """An empty results dict means no identity has resolved email coverage -
+    the "every channel failed" shortcut doesn't fire (nothing to call
+    "failed"), but validate_identity_coverage() must still refuse to start
+    listen() with zero identities able to route inbound email."""
     fake_client = _FakeClient()
     monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
     monkeypatch.setattr(worker_module, "register_identities", lambda client: {})
 
-    worker_module.main()
+    with pytest.raises(RuntimeError):
+        worker_module.main()
 
-    assert fake_client.listen_called is True
+    assert fake_client.listen_called is False
 
 
-def test_main_reaches_listen_when_all_already_registered(monkeypatch):
-    """C1: a restart where every channel comes back 409 (ALREADY_REGISTERED)
-    must not be treated as 'every channel failed' - it's the expected
-    steady state from restart #2 onward."""
+def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch):
+    """A 409 (ALREADY_REGISTERED) on an identity's email gives us no
+    connection_id to route on. Per the live-verified idempotency of
+    connect_email() (see identities.py), a real restart returns the same
+    connection dict again, not a 409 - so this combination means a genuine
+    external conflict, and the worker must not proceed with identities that
+    can't route inbound mail."""
     from app.ingest.identities import ALREADY_REGISTERED
 
     fake_client = _FakeClient()
@@ -82,9 +93,11 @@ def test_main_reaches_listen_when_all_already_registered(monkeypatch):
         lambda client: {
             ("careers", "email"): ALREADY_REGISTERED,
             ("support", "email"): ALREADY_REGISTERED,
+            ("internal", "email"): ALREADY_REGISTERED,
         },
     )
 
-    worker_module.main()
+    with pytest.raises(RuntimeError):
+        worker_module.main()
 
-    assert fake_client.listen_called is True
+    assert fake_client.listen_called is False
