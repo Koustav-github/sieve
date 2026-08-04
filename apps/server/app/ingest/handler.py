@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 from collections.abc import Callable
+from concurrent.futures import Executor
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.classify.pipeline import run_classification
 from app.ingest.message_store import is_duplicate, persist_message
 from app.ingest.sender_resolution import resolve_sender
+from app.models.message import Message
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +46,52 @@ def _raw_payload(message: Any) -> dict[str, Any]:
     return {key: value for key, value in data.items() if not key.startswith("_")}
 
 
+def _classify_and_record(
+    session_factory: Callable[[], Session],
+    classification_graph: Any,
+    *,
+    message_id: int,
+    agent_identity: str,
+    sender_handle: str,
+    subject: str | None,
+    text: str | None,
+) -> None:
+    """Runs on `executor`'s worker thread, off the ingest `listen()` loop -
+    opens its own `Session` (the handler's session belongs to a different
+    thread and is closed by the time this runs). Never raises: a
+    classification failure here must not affect ingestion, which already
+    completed successfully before this was submitted."""
+    db = session_factory()
+    try:
+        message = db.get(Message, message_id)
+        if message is None:
+            logger.error("Classification skipped: message %s no longer exists", message_id)
+            return
+        run_classification(
+            classification_graph,
+            db,
+            message=message,
+            agent_identity=agent_identity,
+            sender_handle=sender_handle,
+            subject=subject,
+            text=text,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Async classification failed for message %s; message was still "
+            "ingested successfully",
+            message_id,
+        )
+    finally:
+        db.close()
+
+
 def build_on_message_handler(
     session_factory: Callable[[], Session],
     connection_identities: dict[str, str],
     classification_graph: Any,
+    executor: Executor,
 ) -> Callable[[Any], None]:
     """`connection_identities` maps a Caspian `connection_id` to one of
     Sieve's 3 fixed identities ("careers"/"support"/"internal") - see
@@ -58,9 +102,10 @@ def build_on_message_handler(
     connection the message arrived on is the only reliable signal.
 
     `classification_graph` is a compiled graph from
-    `app.classify.graph.build_classification_graph` - invoked once per
-    message, after it's durably persisted, to run the L1/L3/subject-extraction
-    cascade and record a `RoutingDecision`.
+    `app.classify.graph.build_classification_graph` - submitted to
+    `executor` once per message, after it's durably persisted, to run the
+    L1/L3/subject-extraction cascade and record a `RoutingDecision` off the
+    ingest `listen()` loop, so LLM latency never blocks message intake.
     """
 
     def handle(message: Any) -> None:
@@ -112,23 +157,16 @@ def build_on_message_handler(
             )
             db.commit()
 
-            try:
-                run_classification(
-                    classification_graph,
-                    db,
-                    message=persisted_message,
-                    agent_identity=agent_id,
-                    sender_handle=sender_handle,
-                    subject=_field(message, "subject"),
-                    text=_field(message, "text"),
-                )
-            except Exception:
-                db.rollback()
-                logger.exception(
-                    "Classification failed for message %s; message was "
-                    "still ingested successfully",
-                    message_id,
-                )
+            executor.submit(
+                _classify_and_record,
+                session_factory,
+                classification_graph,
+                message_id=persisted_message.id,
+                agent_identity=agent_id,
+                sender_handle=sender_handle,
+                subject=_field(message, "subject"),
+                text=_field(message, "text"),
+            )
         except IntegrityError:
             # Caspian's listen() can dispatch different conversations
             # concurrently, so two first-contact messages from the same new

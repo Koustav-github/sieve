@@ -4,6 +4,7 @@ from langgraph.graph import END, StateGraph
 
 from app.classify.l1 import match_l1_rules
 from app.classify.schemas import L3ClassificationResult, SubjectExtractionResult
+from app.classify.semantic import SemanticIndexClient, semantic_match
 from app.classify.subject_resolution import resolve_person_by_display_name
 from app.models.bucket import Bucket
 
@@ -22,13 +23,21 @@ class ClassificationState(TypedDict):
     subject_person_entity_id: int | None
 
 
-def build_classification_graph(session_factory, l3_llm, subject_llm):
+def build_classification_graph(
+    session_factory, l3_llm, subject_llm, semantic_client: SemanticIndexClient | None = None
+):
     """`session_factory` yields a fresh `Session` per node's DB access (same
     factory type as `build_on_message_handler`'s `session_factory`).
     `l3_llm`/`subject_llm` are Runnables (real: `app.classify.llm.build_l3_llm()`
     / `build_subject_extraction_llm()`; fakes in tests) whose
     `.invoke(prompt: str)` returns `L3ClassificationResult` /
     `SubjectExtractionResult`.
+
+    `semantic_client` is optional (real:
+    `app.classify.pinecone_client.build_pinecone_client()`, `None` if
+    `PINECONE_API_KEY` isn't configured; fakes in tests) - when present, it
+    runs as a second L1 signal (bucket-centroid similarity) after the
+    rule-based match misses and before falling through to L3.
 
     Returns a compiled graph; call `.invoke(state)` with a `ClassificationState`
     (all decision fields `None`) to run it.
@@ -43,17 +52,40 @@ def build_classification_graph(session_factory, l3_llm, subject_llm):
                 subject=state["subject"],
                 text=state["text"],
             )
+            if match is not None:
+                return {
+                    "bucket_id": match.bucket_id,
+                    "bucket_name": match.bucket_name,
+                    "deciding_layer": "L1",
+                    "confidence": None,
+                    "reason": match.reason,
+                }
+
+            if semantic_client is None:
+                return {}
+
+            haystack = " ".join(filter(None, [state["subject"], state["text"]]))
+            if not haystack:
+                return {}
+            semantic = semantic_match(semantic_client, haystack)
+            if semantic is None:
+                return {}
+            bucket = (
+                db.query(Bucket)
+                .filter(Bucket.name == semantic.bucket_name, Bucket.is_active.is_(True))
+                .one_or_none()
+            )
+            if bucket is None:
+                return {}
+            return {
+                "bucket_id": bucket.id,
+                "bucket_name": bucket.name,
+                "deciding_layer": "L1_semantic",
+                "confidence": semantic.score,
+                "reason": f"L1 semantic match on bucket centroid (score={semantic.score:.2f})",
+            }
         finally:
             db.close()
-        if match is None:
-            return {}
-        return {
-            "bucket_id": match.bucket_id,
-            "bucket_name": match.bucket_name,
-            "deciding_layer": "L1",
-            "confidence": None,
-            "reason": match.reason,
-        }
 
     def route_after_l1(state: ClassificationState) -> str:
         return "subject_gate" if state.get("bucket_id") is not None else "l3"

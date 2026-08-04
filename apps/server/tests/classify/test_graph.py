@@ -199,3 +199,72 @@ def test_l3_unknown_bucket_name_soft_failure(session_factory, db_session):
     assert final["deciding_layer"] == "L3"
     assert "L3 returned unknown bucket 'nonexistent_bucket'" in final["reason"]
     assert "matches async tasks" in final["reason"]
+
+
+class _FakeSemanticClient:
+    def __init__(self, results):
+        self.results = results
+
+    def embed(self, text):
+        return [0.1, 0.2]
+
+    def query(self, vector, top_k):
+        return self.results
+
+
+def test_semantic_match_short_circuits_l3_when_rules_miss(session_factory, db_session):
+    bucket = Bucket(name="customer_support", description="support", is_active=True)
+    db_session.add(bucket)
+    db_session.commit()
+
+    l3_llm = _FakeLLM(L3ClassificationResult(bucket_name="unused", reason="unused", confidence=0.1))
+    subject_llm = _FakeLLM(SubjectExtractionResult(subject_name=None, reason="n/a"))
+    semantic_client = _FakeSemanticClient([("customer_support", 0.88)])
+    graph = build_classification_graph(
+        session_factory, l3_llm, subject_llm, semantic_client=semantic_client
+    )
+
+    final = graph.invoke(
+        _initial_state(subject="order help", text="my order never arrived")
+    )
+
+    assert final["deciding_layer"] == "L1_semantic"
+    assert final["bucket_id"] == bucket.id
+    assert final["confidence"] == 0.88
+    assert l3_llm.calls == []
+
+
+def test_semantic_miss_falls_through_to_l3(session_factory, db_session):
+    bucket = Bucket(name="customer_support", description="support", is_active=True)
+    db_session.add(bucket)
+    db_session.commit()
+
+    l3_llm = _FakeLLM(
+        L3ClassificationResult(bucket_name="customer_support", reason="L3 called", confidence=0.6)
+    )
+    subject_llm = _FakeLLM(SubjectExtractionResult(subject_name=None, reason="n/a"))
+    semantic_client = _FakeSemanticClient([])  # no results -> None
+    graph = build_classification_graph(
+        session_factory, l3_llm, subject_llm, semantic_client=semantic_client
+    )
+
+    final = graph.invoke(_initial_state(subject="hi", text="hi"))
+
+    assert final["deciding_layer"] == "L3"
+    assert len(l3_llm.calls) == 1
+
+
+def test_no_semantic_client_skips_semantic_signal_entirely(session_factory, db_session):
+    bucket = Bucket(name="customer_support", description="support", is_active=True)
+    db_session.add(bucket)
+    db_session.commit()
+
+    l3_llm = _FakeLLM(
+        L3ClassificationResult(bucket_name="customer_support", reason="L3 called", confidence=0.6)
+    )
+    subject_llm = _FakeLLM(SubjectExtractionResult(subject_name=None, reason="n/a"))
+    graph = build_classification_graph(session_factory, l3_llm, subject_llm)
+
+    final = graph.invoke(_initial_state(subject="hi", text="hi"))
+
+    assert final["deciding_layer"] == "L3"

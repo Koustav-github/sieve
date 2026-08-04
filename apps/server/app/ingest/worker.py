@@ -1,9 +1,11 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from caspian_sdk import CommClient
 
 from app.classify.graph import build_classification_graph
 from app.classify.llm import build_l3_llm, build_subject_extraction_llm
+from app.classify.pinecone_client import build_pinecone_client
 from app.classify.seed import seed_buckets_and_rules
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -16,6 +18,11 @@ from app.ingest.identities import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Classification runs off the ingest listen() loop (see handler._classify_and_record)
+# so LLM latency never blocks message intake; bounded to avoid unbounded thread
+# growth under a burst of messages.
+CLASSIFICATION_EXECUTOR_WORKERS = 4
 
 
 def main() -> None:
@@ -54,11 +61,19 @@ def main() -> None:
         )
 
     classification_graph = build_classification_graph(
-        SessionLocal, build_l3_llm(), build_subject_extraction_llm()
+        SessionLocal,
+        build_l3_llm(),
+        build_subject_extraction_llm(),
+        semantic_client=build_pinecone_client(),
+    )
+    classification_executor = ThreadPoolExecutor(
+        max_workers=CLASSIFICATION_EXECUTOR_WORKERS, thread_name_prefix="classify"
     )
 
     client.on_message(
-        build_on_message_handler(SessionLocal, connection_identities, classification_graph)
+        build_on_message_handler(
+            SessionLocal, connection_identities, classification_graph, classification_executor
+        )
     )
     logger.info("Sieve ingestion worker listening...")
     client.listen()

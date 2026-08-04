@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock
 
+import pytest
+
 from app.classify import llm as llm_module
 from app.classify.schemas import L3ClassificationResult, SubjectExtractionResult
 
@@ -38,3 +40,24 @@ def test_build_l3_llm_passes_configured_api_key(monkeypatch):
 
     _, kwargs = fake_chat_cls.call_args
     assert kwargs["api_key"] == "test-key-123"
+
+
+def test_build_l3_llm_uses_groq_when_provider_is_groq(monkeypatch):
+    monkeypatch.setattr(llm_module.settings, "groq_api_key", "groq-key-456")
+    fake_chat = MagicMock()
+    fake_bound = MagicMock()
+    fake_chat.with_structured_output.return_value = fake_bound
+    fake_chat_cls = MagicMock(return_value=fake_chat)
+    monkeypatch.setattr(llm_module, "ChatGroq", fake_chat_cls)
+
+    result = llm_module.build_l3_llm(provider="groq")
+
+    _, kwargs = fake_chat_cls.call_args
+    assert kwargs["api_key"] == "groq-key-456"
+    fake_chat.with_structured_output.assert_called_once_with(L3ClassificationResult)
+    assert result is fake_bound
+
+
+def test_build_l3_llm_rejects_unknown_provider():
+    with pytest.raises(ValueError, match="Unknown classification_llm_provider"):
+        llm_module.build_l3_llm(provider="bogus")

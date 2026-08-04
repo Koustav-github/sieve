@@ -82,6 +82,38 @@ def test_no_match_returns_none(db_session):
     assert result is None
 
 
+def test_keyword_rule_matches_fuzzy_near_miss(db_session):
+    _make_bucket_with_rule(
+        db_session, bucket_name="escalation", rule_type="keyword", pattern="harassment"
+    )
+
+    result = match_l1_rules(
+        db_session,
+        sender_handle="a@example.com",
+        subject="FYI",
+        text="reporting harasment from a coworker",
+    )
+
+    assert result is not None
+    assert result.bucket_name == "escalation"
+    assert "fuzzy-matched" in result.reason
+
+
+def test_keyword_rule_does_not_fuzzy_match_below_threshold(db_session):
+    _make_bucket_with_rule(
+        db_session, bucket_name="escalation", rule_type="keyword", pattern="urgent"
+    )
+
+    result = match_l1_rules(
+        db_session,
+        sender_handle="a@example.com",
+        subject="server down urgnet please help",
+        text=None,
+    )
+
+    assert result is None
+
+
 def test_inactive_rule_is_ignored(db_session):
     bucket = Bucket(name="escalation", description="escalation", is_active=True)
     db_session.add(bucket)

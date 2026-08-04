@@ -39,6 +39,19 @@ hardcoded dev values, these five are read from that root `.env` via Docker
 Compose's built-in `${VAR}` substitution, since they're real secrets that
 must never be committed.
 
+Two more classification signals are optional infra, off by default:
+- **Groq as the L3 provider**: set `CLASSIFICATION_LLM_PROVIDER=groq` and
+  `GROQ_API_KEY` to use Groq instead of Anthropic for L3's zero-shot call
+  (subject extraction always stays on Anthropic). Leave both unset/default
+  (`anthropic`) to keep the existing, tested behavior.
+- **Pinecone semantic matching**: set `PINECONE_API_KEY` (and optionally
+  `PINECONE_INDEX`, default `sieve-classification`) to add a bucket-centroid
+  similarity signal to L1, checked after the rule-based match misses and
+  before falling through to L3. Run `uv run python -m
+  app.classify.seed_pinecone` once (and again after editing exemplars in
+  `seed_data.json`) to populate the index. With no key set, this signal is
+  skipped entirely - `ingest` runs fine without it.
+
 If you're not working on ingestion (e.g. a frontend dev doing `docker
 compose up` with no root `.env` at all), `db`, `server`, and `client` come up
 fine regardless. `ingest` will still fail fast: with no `CASPIAN_API_KEY` at

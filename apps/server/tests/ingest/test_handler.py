@@ -32,6 +32,17 @@ class _StubClassificationGraph:
 STUB_GRAPH = _StubClassificationGraph()
 
 
+class _SyncExecutor:
+    """Runs `submit()`'d work immediately, inline, on the caller's thread -
+    keeps tests deterministic without waiting on a real thread pool."""
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+
+SYNC_EXECUTOR = _SyncExecutor()
+
+
 def _fake_message(**overrides):
     defaults = dict(
         id="msg-100",
@@ -46,7 +57,7 @@ def _fake_message(**overrides):
 
 
 def test_handles_new_message_end_to_end(session_factory):
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message())
 
     db = session_factory()
@@ -62,7 +73,7 @@ def test_handles_new_message_end_to_end(session_factory):
 
 
 def test_duplicate_message_is_not_persisted_twice(session_factory):
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-101"))
     handle(_fake_message(id="msg-101"))
 
@@ -75,7 +86,7 @@ def test_duplicate_message_is_not_persisted_twice(session_factory):
 
 
 def test_known_sender_reuses_person_entity(session_factory):
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-102", sender={"address": "same@example.com"}))
     handle(_fake_message(id="msg-103", sender={"address": "same@example.com"}))
 
@@ -87,7 +98,7 @@ def test_known_sender_reuses_person_entity(session_factory):
 
 
 def test_message_missing_required_fields_is_dropped(session_factory):
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-104", sender={}))
 
     db = session_factory()
@@ -106,7 +117,7 @@ def test_handler_catches_and_logs_exception_without_propagating(session_factory,
 
     monkeypatch.setattr(handler_module, "persist_message", failing_persist_message)
 
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     # This should NOT raise, even though persist_message fails
     handle(_fake_message(id="msg-105"))
 
@@ -129,7 +140,7 @@ def test_handler_treats_integrity_error_as_expected_race(session_factory, monkey
 
     monkeypatch.setattr(handler_module, "persist_message", failing_persist_message)
 
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     with caplog.at_level(logging.WARNING, logger="app.ingest.handler"):
         handle(_fake_message(id="msg-106"))
 
@@ -148,7 +159,7 @@ def test_handler_treats_integrity_error_as_expected_race(session_factory, monkey
 
 def test_thread_id_reads_conversation_id_primary(session_factory):
     """I1: the real caspian_sdk.Message has `conversation_id`, not `thread_id`."""
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-107", conversation_id="conv-77"))
 
     db = session_factory()
@@ -162,7 +173,7 @@ def test_thread_id_reads_conversation_id_primary(session_factory):
 def test_thread_id_falls_back_to_thread_id_attr(session_factory):
     """I1: `thread_id` remains a fallback for robustness against simpler fakes
     that don't set `conversation_id` at all."""
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-108", thread_id="legacy-thread-9"))
 
     db = session_factory()
@@ -177,7 +188,7 @@ def test_raw_payload_includes_full_real_message_fields(session_factory):
     """I2: raw_payload must be built from the real caspian_sdk.Message dataclass
     fields (subject, html, media, ids, ...), not a hand-picked subset -
     `subject` in particular is the primary bucketing signal for classification."""
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     caspian_message = CaspianMessage(
         id="msg-200",
         conversation_id="conv-200",
@@ -217,7 +228,7 @@ def test_raw_payload_includes_full_real_message_fields(session_factory):
 def test_raw_payload_falls_back_to_vars_for_non_dataclass_fake(session_factory):
     """I2: the fallback path must still work for the simple SimpleNamespace
     fakes used elsewhere in this file, which aren't real dataclasses."""
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, STUB_GRAPH, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-201"))
 
     db = session_factory()
@@ -252,7 +263,7 @@ def test_handler_invokes_classification_and_persists_routing_decision(session_fa
         _FakeLLM(SubjectExtractionResult(subject_name=None, reason="n/a")),
     )
 
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, graph)
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, graph, SYNC_EXECUTOR)
     handle(_fake_message(id="msg-300"))
 
     db = session_factory()
@@ -270,7 +281,7 @@ def test_handler_survives_classification_failure_message_still_persisted(session
         def invoke(self, state):
             raise RuntimeError("graph blew up")
 
-    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, _RaisingGraph())
+    handle = build_on_message_handler(session_factory, CONNECTION_IDENTITIES, _RaisingGraph(), SYNC_EXECUTOR)
     handle(_fake_message(id="msg-301"))
 
     db = session_factory()
@@ -278,3 +289,53 @@ def test_handler_survives_classification_failure_message_still_persisted(session
         assert db.query(Message).filter_by(caspian_message_id="msg-301").count() == 1
     finally:
         db.close()
+
+
+def test_handler_dispatches_classification_asynchronously(session_factory):
+    """Classification must run off the ingest listen() loop: handle() should
+    return (and the message should already be durably persisted) before a
+    slow classification graph finishes, proving the two are not serialized
+    on the same thread."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    class _SlowGraph:
+        def invoke(self, state):
+            started.set()
+            time.sleep(0.3)
+            finished.set()
+            return {
+                **state,
+                "bucket_id": None,
+                "bucket_name": None,
+                "deciding_layer": "L1",
+                "confidence": None,
+                "reason": "slow",
+                "subject_raw_text": None,
+                "subject_person_entity_id": None,
+            }
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        handle = build_on_message_handler(
+            session_factory, CONNECTION_IDENTITIES, _SlowGraph(), executor
+        )
+        handle(_fake_message(id="msg-400"))
+
+        # handle() returned without waiting for the slow graph to finish.
+        assert not finished.is_set()
+
+        db = session_factory()
+        try:
+            assert db.query(Message).filter_by(caspian_message_id="msg-400").count() == 1
+        finally:
+            db.close()
+
+        assert started.wait(timeout=2), "classification never started"
+        assert finished.wait(timeout=2), "classification never finished"
+    finally:
+        executor.shutdown(wait=True)

@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     discord_bot_token: str = ""
     anthropic_api_key: str = ""
+    groq_api_key: str = ""
+    classification_llm_provider: str = "anthropic"
+    pinecone_api_key: str = ""
+    pinecone_index: str = "sieve-classification"
 
 
 settings = Settings()
