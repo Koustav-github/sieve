@@ -9,7 +9,7 @@ Ingestion (spec §4 stages 1–3) is done: every inbound message is persisted, d
 This sub-project adds spec §4 stage 4 ("fine bucket — classification cascade"), scoped down from the spec's original 3-layer L1/owner-rules + L2/embeddings-shadow-mode + L3/LLM design to a simpler 2-layer cascade, per project-owner decision:
 
 - **Layer 1** — keyword matching, fuzzy matching, and semantic similarity, evaluated together as one cheap layer (merges the spec's original L1 and L2 into one non-LLM pass).
-- **Layer 2** — an LLM call (Grok), used only when Layer 1 produces no confident match.
+- **Layer 2** — an LLM call (Groq), used only when Layer 1 produces no confident match.
 
 This intentionally diverges from the spec document's L1/L2/L3 labels; "Layer 1"/"Layer 2" in this doc refer only to the 2-layer design above, not the spec's original three.
 
@@ -17,7 +17,7 @@ This intentionally diverges from the spec document's L1/L2/L3 labels; "Layer 1"/
 
 - Classify every message into a **fine bucket** within its existing coarse bucket (careers/support/internal), using a hardcoded starter taxonomy.
 - Layer 1: score each fine bucket in the message's coarse bucket via keyword match, fuzzy match, and semantic similarity; each signal has its own threshold; any one signal clearing its threshold for a bucket wins.
-- Layer 2 (fallback): when no fine bucket wins on any Layer 1 signal, ask Grok to zero-shot classify against that coarse bucket's fine-bucket names/descriptions, with structured output (bucket, reason, confidence).
+- Layer 2 (fallback): when no fine bucket wins on any Layer 1 signal, ask Groq to zero-shot classify against that coarse bucket's fine-bucket names/descriptions, with structured output (bucket, reason, confidence).
 - Keep ingestion's `listen()` loop responsive: classification runs as an async follow-up after the message is already persisted and committed, not inline in `on_message`.
 - Record which layer decided and with what confidence, on the message itself.
 
@@ -39,7 +39,7 @@ apps/server/
 │   │   ├── buckets.py         # hardcoded taxonomy: fine buckets per coarse identity,
 │   │   │                      # each with keywords + exemplar phrases + LLM description
 │   │   ├── layer1.py          # keyword / fuzzy (rapidfuzz) / semantic (Pinecone) matching
-│   │   ├── layer2.py          # Grok zero-shot call, structured output
+│   │   ├── layer2.py          # Groq zero-shot call, structured output
 │   │   ├── classifier.py      # orchestrates layer1 -> layer2 fallback, writes result
 │   │   └── seed_pinecone.py   # one-off script: embeds each bucket's exemplars,
 │   │                          # upserts one centroid vector per bucket into Pinecone
@@ -48,7 +48,7 @@ apps/server/
 │   │   └── handler.py         # after persist+commit, submits classification to the executor
 ```
 
-`app/ingest/worker.py` creates one `concurrent.futures.ThreadPoolExecutor` at startup and passes it into `build_on_message_handler`. The handler's job stays exactly as it is today through `db.commit()`; the only addition is `executor.submit(classifier.classify, message_id)` right after commit, non-blocking. This keeps `client.listen()`'s per-message dispatch loop fast — Pinecone/Grok network latency happens off that loop, in a worker thread.
+`app/ingest/worker.py` creates one `concurrent.futures.ThreadPoolExecutor` at startup and passes it into `build_on_message_handler`. The handler's job stays exactly as it is today through `db.commit()`; the only addition is `executor.submit(classifier.classify, message_id)` right after commit, non-blocking. This keeps `client.listen()`'s per-message dispatch loop fast — Pinecone/Groq network latency happens off that loop, in a worker thread.
 
 ## Data flow
 
@@ -61,9 +61,9 @@ apps/server/
       - Fuzzy: `rapidfuzz` similarity score against each bucket's keyword list.
       - Semantic: embed the message text via Pinecone's Inference API, query the Pinecone index (filtered to this coarse bucket's fine-bucket centroids) for cosine similarity.
       - Each signal has its own threshold. The first fine bucket where any signal clears its threshold wins. If multiple buckets would win, the earliest-declared bucket in `buckets.py` wins (deterministic tie-break).
-   c. **Layer 2 fallback** (`layer2.py`): if no fine bucket won in Layer 1, call Grok with the coarse bucket's fine-bucket names + descriptions, requesting structured output `{bucket, reason, confidence}`.
+   c. **Layer 2 fallback** (`layer2.py`): if no fine bucket won in Layer 1, call Groq with the coarse bucket's fine-bucket names + descriptions, requesting structured output `{bucket, reason, confidence}`.
    d. Writes `fine_bucket`, `classified_by` (`"layer1"` / `"layer2"`), `confidence`, `classified_at` onto the `messages` row.
-4. On any exception (Pinecone/Grok error, timeout, malformed response): log at ERROR with the message id, leave the message's classification columns `NULL`. No retry in this sub-project.
+4. On any exception (Pinecone/Groq error, timeout, malformed response): log at ERROR with the message id, leave the message's classification columns `NULL`. No retry in this sub-project.
 
 ## Starter taxonomy (hardcoded in `buckets.py`)
 
@@ -92,7 +92,7 @@ No new table. `routing_decisions` (spec §8) remains deferred to the future audi
 
 New settings on `app/core/config.py`'s `Settings`, following the existing pattern for `CASPIAN_API_KEY`/`TELEGRAM_BOT_TOKEN`:
 
-- `GROK_API_KEY` — xAI Grok, Layer 2.
+- `GROQ_API_KEY` — Groq Inc., Layer 2.
 - `PINECONE_API_KEY` — Pinecone, Layer 1 semantic signal (both embeddings and vector storage/query).
 - `PINECONE_INDEX` — the index name `seed_pinecone.py` upserts into and `layer1.py` queries.
 
@@ -101,13 +101,13 @@ Added to `.env.example` alongside the existing Caspian/bot-token entries.
 ## Error handling
 
 - **Layer 1 signal failure** (e.g. Pinecone request fails): that signal is skipped for this message (treated as "did not clear threshold"), not a hard failure — the other signals and Layer 2 fallback still get a chance. Logged at WARNING.
-- **Layer 2 (Grok) failure or malformed structured output**: caught, logged at ERROR with the message id, message left unclassified (`fine_bucket = NULL`).
+- **Layer 2 (Groq) failure or malformed structured output**: caught, logged at ERROR with the message id, message left unclassified (`fine_bucket = NULL`).
 - **Classification failure must never affect ingestion**: the executor submission happens after `db.commit()`, so a classification failure of any kind cannot cause a message to be lost or unpersisted — worst case, a message simply sits unclassified.
 
 ## Testing
 
 - `layer1.py`: unit tests per signal (keyword hit, fuzzy near-miss above/below threshold, semantic similarity above/below threshold via a mocked Pinecone client) — no live network call.
-- `layer2.py`: unit test with a mocked Grok client, asserting structured-output parsing and the failure/malformed-response path.
+- `layer2.py`: unit test with a mocked Groq client, asserting structured-output parsing and the failure/malformed-response path.
 - `classifier.py`: unit tests covering layer1-wins, layer1-fails-falls-to-layer2, and both-fail-stays-unclassified paths, plus the tie-break rule when multiple buckets would win Layer 1.
 - No live smoke test automated — matches ingestion's existing precedent (manual only, no CI pipeline yet).
 
