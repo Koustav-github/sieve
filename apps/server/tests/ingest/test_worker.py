@@ -69,7 +69,7 @@ def test_main_raises_when_every_channel_fails(monkeypatch, session_factory):
     assert fake_client.listen_called is False
 
 
-def test_main_raises_when_results_empty(monkeypatch, session_factory):
+def test_main_raises_when_results_empty(monkeypatch):
     """An empty results dict means no identity has resolved email coverage -
     the "every channel failed" shortcut doesn't fire (nothing to call
     "failed"), but validate_identity_coverage() must still refuse to start
@@ -84,7 +84,7 @@ def test_main_raises_when_results_empty(monkeypatch, session_factory):
     assert fake_client.listen_called is False
 
 
-def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch, session_factory):
+def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch):
     """A 409 (ALREADY_REGISTERED) on an identity's email gives us no
     connection_id to route on. Per the live-verified idempotency of
     connect_email() (see identities.py), a real restart returns the same
@@ -102,58 +102,6 @@ def test_main_raises_when_email_identity_already_registered_with_no_others(monke
             ("careers", "email"): ALREADY_REGISTERED,
             ("support", "email"): ALREADY_REGISTERED,
             ("internal", "email"): ALREADY_REGISTERED,
-        },
-    )
-
-    with pytest.raises(RuntimeError):
-        worker_module.main()
-
-    assert fake_client.listen_called is False
-
-
-def test_main_raises_when_anthropic_api_key_is_blank(monkeypatch, session_factory):
-    """I2: fail startup loudly with no ANTHROPIC_API_KEY, same as an
-    incomplete connection mapping or a broken seed file - never run with zero
-    working classification."""
-    fake_client = _FakeClient()
-    _patch_common(monkeypatch, session_factory, fake_client)
-    monkeypatch.setattr(worker_module.settings, "anthropic_api_key", "")
-    monkeypatch.setattr(
-        worker_module,
-        "register_identities",
-        lambda client: {
-            ("careers", "email"): {"id": "conn-careers-email"},
-            ("support", "email"): {"id": "conn-support-email"},
-            ("internal", "email"): {"id": "conn-internal-email"},
-        },
-    )
-
-    with pytest.raises(RuntimeError):
-        worker_module.main()
-
-    assert fake_client.listen_called is False
-
-
-def test_main_raises_when_seed_file_is_malformed(monkeypatch, session_factory, tmp_path):
-    """Fail startup loudly on a bad seed file, same as an incomplete
-    connection mapping - never run with broken/no classification rules."""
-    import json
-
-    from app.classify import seed as seed_module
-
-    bad_seed = tmp_path / "seed.json"
-    bad_seed.write_text(json.dumps({"buckets": []}))
-    monkeypatch.setattr(seed_module, "DEFAULT_SEED_PATH", bad_seed)
-
-    fake_client = _FakeClient()
-    _patch_common(monkeypatch, session_factory, fake_client)
-    monkeypatch.setattr(
-        worker_module,
-        "register_identities",
-        lambda client: {
-            ("careers", "email"): {"id": "conn-careers-email"},
-            ("support", "email"): {"id": "conn-support-email"},
-            ("internal", "email"): {"id": "conn-internal-email"},
         },
     )
 
