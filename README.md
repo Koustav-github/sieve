@@ -31,12 +31,26 @@ you reach Postgres from the host, e.g. `psql -h localhost -p 5433 -U sieve`.
 
 The `ingest` service runs the Caspian message listener as its own process
 (separate from `server`, so an API reload never disrupts the live Caspian
-connection). It needs real Caspian credentials: copy `.env.example` to a
-root `.env` (gitignored) and fill in `CASPIAN_API_KEY`, `CASPIAN_BASE_URL`,
-`TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`. Unlike the rest of this file's
-hardcoded dev values, these four are read from that root `.env` via Docker
+connection). It needs real Caspian credentials, plus an Anthropic API key for the
+classification cascade: copy `.env.example` to a root `.env` (gitignored)
+and fill in `CASPIAN_API_KEY`, `CASPIAN_BASE_URL`, `TELEGRAM_BOT_TOKEN`,
+`DISCORD_BOT_TOKEN`, `ANTHROPIC_API_KEY`. Unlike the rest of this file's
+hardcoded dev values, these five are read from that root `.env` via Docker
 Compose's built-in `${VAR}` substitution, since they're real secrets that
 must never be committed.
+
+Two more classification signals are optional infra, off by default:
+- **Groq as the L3 provider**: set `CLASSIFICATION_LLM_PROVIDER=groq` and
+  `GROQ_API_KEY` to use Groq instead of Anthropic for L3's zero-shot call
+  (subject extraction always stays on Anthropic). Leave both unset/default
+  (`anthropic`) to keep the existing, tested behavior.
+- **Pinecone semantic matching**: set `PINECONE_API_KEY` (and optionally
+  `PINECONE_INDEX`, default `sieve-classification`) to add a bucket-centroid
+  similarity signal to L1, checked after the rule-based match misses and
+  before falling through to L3. Run `uv run python -m
+  app.classify.seed_pinecone` once (and again after editing exemplars in
+  `seed_data.json`) to populate the index. With no key set, this signal is
+  skipped entirely - `ingest` runs fine without it.
 
 If you're not working on ingestion (e.g. a frontend dev doing `docker
 compose up` with no root `.env` at all), `db`, `server`, and `client` come up

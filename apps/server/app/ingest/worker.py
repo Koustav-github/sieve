@@ -16,6 +16,11 @@ from app.ingest.identities import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Classification runs off the ingest listen() loop (see handler._classify_and_record)
+# so LLM latency never blocks message intake; bounded to avoid unbounded thread
+# growth under a burst of messages.
+CLASSIFICATION_EXECUTOR_WORKERS = 4
+
 
 def main() -> None:
     client = CommClient()

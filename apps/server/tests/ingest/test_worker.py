@@ -16,14 +16,22 @@ class _FakeClient:
         self.listen_called = True
 
 
-def test_main_reaches_listen_with_partial_registration_failures(monkeypatch):
+def _patch_common(monkeypatch, session_factory, fake_client):
+    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(worker_module, "build_l3_llm", lambda: object())
+    monkeypatch.setattr(worker_module, "build_subject_extraction_llm", lambda: object())
+    monkeypatch.setattr(worker_module.settings, "anthropic_api_key", "test-anthropic-key")
+
+
+def test_main_reaches_listen_with_partial_registration_failures(monkeypatch, session_factory):
     """C1: main() must always reach client.listen() when at least one channel
     registered successfully, regardless of other channels' outcomes - as long
     as every identity's *email* coverage (the required-for-all-3 channel) is
     still fully resolved. Here support's telegram fails but all 3 identities'
     email registrations succeed, so listen() must still be reached."""
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
@@ -41,11 +49,11 @@ def test_main_reaches_listen_with_partial_registration_failures(monkeypatch):
     assert len(fake_client.on_message_calls) == 1
 
 
-def test_main_raises_when_every_channel_fails(monkeypatch):
+def test_main_raises_when_every_channel_fails(monkeypatch, session_factory):
     """C1: the only intentional fatal case is when literally every channel
     failed to register - main() must not reach listen() in that case."""
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
@@ -67,7 +75,7 @@ def test_main_raises_when_results_empty(monkeypatch):
     "failed"), but validate_identity_coverage() must still refuse to start
     listen() with zero identities able to route inbound email."""
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(worker_module, "register_identities", lambda client: {})
 
     with pytest.raises(RuntimeError):
@@ -86,7 +94,7 @@ def test_main_raises_when_email_identity_already_registered_with_no_others(monke
     from app.ingest.identities import ALREADY_REGISTERED
 
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
