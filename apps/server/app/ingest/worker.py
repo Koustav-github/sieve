@@ -2,6 +2,9 @@ import logging
 
 from caspian_sdk import CommClient
 
+from app.classify.graph import build_classification_graph
+from app.classify.llm import build_l3_llm, build_subject_extraction_llm
+from app.classify.seed import seed_buckets_and_rules
 from app.db.session import SessionLocal
 from app.ingest.handler import build_on_message_handler
 from app.ingest.identities import (
@@ -36,7 +39,20 @@ def main() -> None:
     connection_identities = connection_identity_map(results)
     logger.info("connection -> identity map: %r", connection_identities)
     validate_identity_coverage(results, connection_identities)
-    client.on_message(build_on_message_handler(SessionLocal, connection_identities))
+
+    db = SessionLocal()
+    try:
+        seed_buckets_and_rules(db)
+    finally:
+        db.close()
+
+    classification_graph = build_classification_graph(
+        SessionLocal, build_l3_llm(), build_subject_extraction_llm()
+    )
+
+    client.on_message(
+        build_on_message_handler(SessionLocal, connection_identities, classification_graph)
+    )
     logger.info("Sieve ingestion worker listening...")
     client.listen()
 

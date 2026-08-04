@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.classify.pipeline import run_classification
 from app.ingest.message_store import is_duplicate, persist_message
 from app.ingest.sender_resolution import resolve_sender
 
@@ -46,6 +47,7 @@ def _raw_payload(message: Any) -> dict[str, Any]:
 def build_on_message_handler(
     session_factory: Callable[[], Session],
     connection_identities: dict[str, str],
+    classification_graph: Any,
 ) -> Callable[[Any], None]:
     """`connection_identities` maps a Caspian `connection_id` to one of
     Sieve's 3 fixed identities ("careers"/"support"/"internal") - see
@@ -54,6 +56,11 @@ def build_on_message_handler(
     id (assigned even when we don't request one) and is NOT one of Sieve's
     identity labels, so it cannot be used as the coarse bucket - the
     connection the message arrived on is the only reliable signal.
+
+    `classification_graph` is a compiled graph from
+    `app.classify.graph.build_classification_graph` - invoked once per
+    message, after it's durably persisted, to run the L1/L3/subject-extraction
+    cascade and record a `RoutingDecision`.
     """
 
     def handle(message: Any) -> None:
@@ -94,7 +101,7 @@ def build_on_message_handler(
                 return
 
             resolve_sender(db, channel=channel, handle=sender_handle)
-            persist_message(
+            persisted_message = persist_message(
                 db,
                 caspian_message_id=message_id,
                 agent_id=agent_id,
@@ -104,6 +111,24 @@ def build_on_message_handler(
                 raw_payload=_raw_payload(message),
             )
             db.commit()
+
+            try:
+                run_classification(
+                    classification_graph,
+                    db,
+                    message=persisted_message,
+                    agent_identity=agent_id,
+                    sender_handle=sender_handle,
+                    subject=_field(message, "subject"),
+                    text=_field(message, "text"),
+                )
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Classification failed for message %s; message was "
+                    "still ingested successfully",
+                    message_id,
+                )
         except IntegrityError:
             # Caspian's listen() can dispatch different conversations
             # concurrently, so two first-contact messages from the same new

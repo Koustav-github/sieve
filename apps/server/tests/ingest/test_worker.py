@@ -16,14 +16,21 @@ class _FakeClient:
         self.listen_called = True
 
 
-def test_main_reaches_listen_with_partial_registration_failures(monkeypatch):
+def _patch_common(monkeypatch, session_factory, fake_client):
+    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    monkeypatch.setattr(worker_module, "SessionLocal", session_factory)
+    monkeypatch.setattr(worker_module, "build_l3_llm", lambda: object())
+    monkeypatch.setattr(worker_module, "build_subject_extraction_llm", lambda: object())
+
+
+def test_main_reaches_listen_with_partial_registration_failures(monkeypatch, session_factory):
     """C1: main() must always reach client.listen() when at least one channel
     registered successfully, regardless of other channels' outcomes - as long
     as every identity's *email* coverage (the required-for-all-3 channel) is
     still fully resolved. Here support's telegram fails but all 3 identities'
     email registrations succeed, so listen() must still be reached."""
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
@@ -41,11 +48,11 @@ def test_main_reaches_listen_with_partial_registration_failures(monkeypatch):
     assert len(fake_client.on_message_calls) == 1
 
 
-def test_main_raises_when_every_channel_fails(monkeypatch):
+def test_main_raises_when_every_channel_fails(monkeypatch, session_factory):
     """C1: the only intentional fatal case is when literally every channel
     failed to register - main() must not reach listen() in that case."""
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
@@ -61,13 +68,13 @@ def test_main_raises_when_every_channel_fails(monkeypatch):
     assert fake_client.listen_called is False
 
 
-def test_main_raises_when_results_empty(monkeypatch):
+def test_main_raises_when_results_empty(monkeypatch, session_factory):
     """An empty results dict means no identity has resolved email coverage -
     the "every channel failed" shortcut doesn't fire (nothing to call
     "failed"), but validate_identity_coverage() must still refuse to start
     listen() with zero identities able to route inbound email."""
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(worker_module, "register_identities", lambda client: {})
 
     with pytest.raises(RuntimeError):
@@ -76,7 +83,7 @@ def test_main_raises_when_results_empty(monkeypatch):
     assert fake_client.listen_called is False
 
 
-def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch):
+def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch, session_factory):
     """A 409 (ALREADY_REGISTERED) on an identity's email gives us no
     connection_id to route on. Per the live-verified idempotency of
     connect_email() (see identities.py), a real restart returns the same
@@ -86,7 +93,7 @@ def test_main_raises_when_email_identity_already_registered_with_no_others(monke
     from app.ingest.identities import ALREADY_REGISTERED
 
     fake_client = _FakeClient()
-    monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
+    _patch_common(monkeypatch, session_factory, fake_client)
     monkeypatch.setattr(
         worker_module,
         "register_identities",
@@ -94,6 +101,35 @@ def test_main_raises_when_email_identity_already_registered_with_no_others(monke
             ("careers", "email"): ALREADY_REGISTERED,
             ("support", "email"): ALREADY_REGISTERED,
             ("internal", "email"): ALREADY_REGISTERED,
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        worker_module.main()
+
+    assert fake_client.listen_called is False
+
+
+def test_main_raises_when_seed_file_is_malformed(monkeypatch, session_factory, tmp_path):
+    """Fail startup loudly on a bad seed file, same as an incomplete
+    connection mapping - never run with broken/no classification rules."""
+    import json
+
+    from app.classify import seed as seed_module
+
+    bad_seed = tmp_path / "seed.json"
+    bad_seed.write_text(json.dumps({"buckets": []}))
+    monkeypatch.setattr(seed_module, "DEFAULT_SEED_PATH", bad_seed)
+
+    fake_client = _FakeClient()
+    _patch_common(monkeypatch, session_factory, fake_client)
+    monkeypatch.setattr(
+        worker_module,
+        "register_identities",
+        lambda client: {
+            ("careers", "email"): {"id": "conn-careers-email"},
+            ("support", "email"): {"id": "conn-support-email"},
+            ("internal", "email"): {"id": "conn-internal-email"},
         },
     )
 
