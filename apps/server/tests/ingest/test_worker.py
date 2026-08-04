@@ -21,6 +21,7 @@ def _patch_common(monkeypatch, session_factory, fake_client):
     monkeypatch.setattr(worker_module, "SessionLocal", session_factory)
     monkeypatch.setattr(worker_module, "build_l3_llm", lambda: object())
     monkeypatch.setattr(worker_module, "build_subject_extraction_llm", lambda: object())
+    monkeypatch.setattr(worker_module.settings, "anthropic_api_key", "test-anthropic-key")
 
 
 def test_main_reaches_listen_with_partial_registration_failures(monkeypatch, session_factory):
@@ -101,6 +102,29 @@ def test_main_raises_when_email_identity_already_registered_with_no_others(monke
             ("careers", "email"): ALREADY_REGISTERED,
             ("support", "email"): ALREADY_REGISTERED,
             ("internal", "email"): ALREADY_REGISTERED,
+        },
+    )
+
+    with pytest.raises(RuntimeError):
+        worker_module.main()
+
+    assert fake_client.listen_called is False
+
+
+def test_main_raises_when_anthropic_api_key_is_blank(monkeypatch, session_factory):
+    """I2: fail startup loudly with no ANTHROPIC_API_KEY, same as an
+    incomplete connection mapping or a broken seed file - never run with zero
+    working classification."""
+    fake_client = _FakeClient()
+    _patch_common(monkeypatch, session_factory, fake_client)
+    monkeypatch.setattr(worker_module.settings, "anthropic_api_key", "")
+    monkeypatch.setattr(
+        worker_module,
+        "register_identities",
+        lambda client: {
+            ("careers", "email"): {"id": "conn-careers-email"},
+            ("support", "email"): {"id": "conn-support-email"},
+            ("internal", "email"): {"id": "conn-internal-email"},
         },
     )
 

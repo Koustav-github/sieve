@@ -25,3 +25,14 @@ def test_provisional_entity_with_no_display_name_is_never_matched(db_session):
     person = resolve_person_by_display_name(db_session, "Jane Doe")
 
     assert person is None
+
+
+def test_multiple_matches_returns_one_without_raising(db_session):
+    db_session.add(PersonEntity(display_name="John Smith", is_provisional=False))
+    db_session.add(PersonEntity(display_name="john smith", is_provisional=False))
+    db_session.commit()
+
+    person = resolve_person_by_display_name(db_session, "John Smith")
+
+    assert person is not None
+    assert person.display_name.lower() == "john smith"

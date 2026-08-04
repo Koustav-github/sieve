@@ -5,6 +5,7 @@ from caspian_sdk import CommClient
 from app.classify.graph import build_classification_graph
 from app.classify.llm import build_l3_llm, build_subject_extraction_llm
 from app.classify.seed import seed_buckets_and_rules
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.ingest.handler import build_on_message_handler
 from app.ingest.identities import (
@@ -45,6 +46,12 @@ def main() -> None:
         seed_buckets_and_rules(db)
     finally:
         db.close()
+
+    if not settings.anthropic_api_key:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set - refusing to start with no working "
+            "classification"
+        )
 
     classification_graph = build_classification_graph(
         SessionLocal, build_l3_llm(), build_subject_extraction_llm()
