@@ -1,3 +1,4 @@
+import pytest
 from caspian_sdk import CommError
 
 from app.core.config import settings
@@ -5,6 +6,7 @@ from app.ingest.identities import (
     ALREADY_REGISTERED,
     connection_identity_map,
     register_identities,
+    validate_identity_coverage,
 )
 
 
@@ -131,6 +133,61 @@ def test_register_identities_logs_and_continues_on_other_errors(monkeypatch, cap
     # Discord (same identity, registered after slack) still attempted.
     assert results[("internal", "discord")] is not None
     assert results[("careers", "email")] is not None
+
+
+def test_connection_identity_map_raises_on_duplicate_connection_id():
+    """Live-observed sandbox bug: careers/email and internal/email can both
+    resolve to the same connection_id when the gateway doesn't give each
+    identity its own mailbox. Silently letting the later identity win would
+    misroute all of the earlier identity's inbound mail - this must raise
+    instead."""
+    results = {
+        ("careers", "email"): {"id": "conn-shared-email", "status": "active"},
+        ("internal", "email"): {"id": "conn-shared-email", "status": "active"},
+    }
+
+    with pytest.raises(ValueError):
+        connection_identity_map(results)
+
+
+def test_validate_identity_coverage_raises_on_already_registered_email():
+    """A 409 (ALREADY_REGISTERED) email result gives us no connection_id to
+    route on - startup must fail rather than silently listen() with that
+    identity's email unroutable."""
+    results = {
+        ("careers", "email"): ALREADY_REGISTERED,
+        ("support", "email"): {"id": "conn-support-email", "status": "active"},
+        ("internal", "email"): {"id": "conn-internal-email", "status": "active"},
+    }
+    mapping = connection_identity_map(results)
+
+    with pytest.raises(RuntimeError):
+        validate_identity_coverage(results, mapping)
+
+
+def test_validate_identity_coverage_raises_on_missing_email_result():
+    """A None (skipped/failed) email result is the same "can't route" case as
+    a 409 - must also fail startup."""
+    results = {
+        ("careers", "email"): None,
+        ("support", "email"): {"id": "conn-support-email", "status": "active"},
+        ("internal", "email"): {"id": "conn-internal-email", "status": "active"},
+    }
+    mapping = connection_identity_map(results)
+
+    with pytest.raises(RuntimeError):
+        validate_identity_coverage(results, mapping)
+
+
+def test_validate_identity_coverage_passes_when_every_email_identity_resolved():
+    results = {
+        ("careers", "email"): {"id": "conn-careers-email", "status": "active"},
+        ("support", "email"): {"id": "conn-support-email", "status": "active"},
+        ("internal", "email"): {"id": "conn-internal-email", "status": "active"},
+    }
+    mapping = connection_identity_map(results)
+
+    validate_identity_coverage(results, mapping)  # must not raise
 
 
 def test_register_identities_skips_blank_bot_tokens(monkeypatch):

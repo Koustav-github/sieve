@@ -57,7 +57,7 @@ apps/server/
 3. **Dedup check**: look up by `caspian_message_id`. If a row already exists, return immediately — `listen()` reconnects can redeliver, so this must be idempotent.
 4. **Persist**: insert a `messages` row — raw payload (JSON), channel, agent_id, sender handle, thread id, received timestamp.
 5. **Resolve sender**: look up `sender.address` in `channel_handles` for this channel. Hit → attach the existing `person_entities.id`. Miss → create a new `person_entities` row (`is_provisional=True`) plus the new `channel_handles` mapping.
-6. **Coarse bucket**: `agent_id` (`careers`/`support`/`internal`) is stored directly on the message row — it *is* the coarse bucket per spec §3, no separate lookup needed.
+6. **Coarse bucket**: Caspian's own `Message.agent_id` is a platform-internal id, not one of Sieve's labels, so it can't be used directly. The identity (`careers`/`support`/`internal`) is instead resolved by looking up the message's `connection_id` in a `connection_id → identity` map built from `register_identities()`'s return value (see `app/ingest/identities.py`'s `connection_identity_map`), and that resolved label is what's stored on the message row's `agent_id` column.
 
 Nothing past stage 3 (classification, subject extraction, visibility, budget, delivery, audit) is in scope here.
 
