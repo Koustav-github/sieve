@@ -1,0 +1,14 @@
+{
+  "buckets": [
+    {"name": "job_application", "description": "Job applications, referrals, and recruiter inbound sent to careers@."},
+    {"name": "customer_support", "description": "Customer or vendor support requests, questions, and complaints."},
+    {"name": "vendor_invoice", "description": "Vendor invoices, billing, and payment-related correspondence."},
+    {"name": "internal_routine", "description": "Routine internal staff traffic with no urgency."},
+    {"name": "internal_escalation", "description": "Internal traffic requiring immediate attention: complaints about a specific person, urgent operational issues, or anything time-sensitive."}
+  ],
+  "rules": [
+    {"bucket": "internal_escalation", "rule_type": "keyword", "pattern": "URGENT"},
+    {"bucket": "internal_escalation", "rule_type": "keyword", "pattern": "harassment"},
+    {"bucket": "vendor_invoice", "rule_type": "keyword", "pattern": "invoice"}
+  ]
+}
