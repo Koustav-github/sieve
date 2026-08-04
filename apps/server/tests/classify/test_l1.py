@@ -96,3 +96,19 @@ def test_inactive_rule_is_ignored(db_session):
     )
 
     assert result is None
+
+
+def test_inactive_bucket_is_ignored_even_if_rule_is_active(db_session):
+    bucket = Bucket(name="escalation", description="escalation", is_active=False)
+    db_session.add(bucket)
+    db_session.flush()
+    db_session.add(
+        Rule(bucket_id=bucket.id, rule_type="keyword", pattern="urgent", is_active=True)
+    )
+    db_session.commit()
+
+    result = match_l1_rules(
+        db_session, sender_handle="a@example.com", subject="URGENT", text=None
+    )
+
+    assert result is None

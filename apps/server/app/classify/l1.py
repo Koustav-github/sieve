@@ -31,7 +31,12 @@ def match_l1_rules(
     domain = sender_handle.rsplit("@", 1)[-1].lower() if "@" in sender_handle else None
 
     rules = (
-        db.execute(select(Rule).join(Bucket).where(Rule.is_active.is_(True)).order_by(Rule.id))
+        db.execute(
+            select(Rule).join(Bucket).where(
+                Rule.is_active.is_(True),
+                Bucket.is_active.is_(True),
+            ).order_by(Rule.id)
+        )
         .scalars()
         .all()
     )
