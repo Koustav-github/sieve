@@ -146,3 +146,56 @@ def test_internal_traffic_falls_back_to_raw_text_when_unresolved(session_factory
 
     assert final["subject_person_entity_id"] is None
     assert final["subject_raw_text"] == "Someone Unknown"
+
+
+def test_l1_match_with_internal_identity_runs_subject_extraction(session_factory, db_session):
+    """L1-decided bucket + agent_identity="internal" must still run subject extraction."""
+    db_session.add(PersonEntity(display_name="Alice Smith", is_provisional=False))
+    bucket = Bucket(name="escalation", description="escalation", is_active=True)
+    db_session.add(bucket)
+    db_session.flush()
+    db_session.add(
+        Rule(bucket_id=bucket.id, rule_type="keyword", pattern="urgent", is_active=True)
+    )
+    db_session.commit()
+
+    l3_llm = _FakeLLM(
+        L3ClassificationResult(bucket_name="escalation", reason="unused", confidence=0.9)
+    )
+    subject_llm = _FakeLLM(SubjectExtractionResult(subject_name="Alice Smith", reason="named"))
+    graph = build_classification_graph(session_factory, l3_llm, subject_llm)
+
+    final = graph.invoke(
+        _initial_state(agent_identity="internal", subject="URGENT: re: Alice", text="Alice needs help")
+    )
+
+    # L1 short-circuited L3
+    assert l3_llm.calls == []
+    # Subject extraction still ran
+    assert len(subject_llm.calls) > 0
+    # Subject was resolved to a person
+    assert final["subject_person_entity_id"] is not None
+    assert final["deciding_layer"] == "L1"
+
+
+def test_l3_unknown_bucket_name_soft_failure(session_factory, db_session):
+    """L3 naming an unknown bucket must be a soft failure, not a crash."""
+    # Create one bucket so the catalog is not empty, but don't create "nonexistent_bucket"
+    bucket = Bucket(name="customer_support", description="support", is_active=True)
+    db_session.add(bucket)
+    db_session.commit()
+
+    # L3 LLM returns a well-formed result with a bucket name that doesn't exist
+    l3_llm = _FakeLLM(
+        L3ClassificationResult(bucket_name="nonexistent_bucket", reason="matches async tasks", confidence=0.7)
+    )
+    subject_llm = _FakeLLM(SubjectExtractionResult(subject_name=None, reason="n/a"))
+    graph = build_classification_graph(session_factory, l3_llm, subject_llm)
+
+    final = graph.invoke(_initial_state(subject="hi", text="hi"))
+
+    assert final["bucket_id"] is None
+    assert final["bucket_name"] == "nonexistent_bucket"
+    assert final["deciding_layer"] == "L3"
+    assert "L3 returned unknown bucket 'nonexistent_bucket'" in final["reason"]
+    assert "matches async tasks" in final["reason"]
