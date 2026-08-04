@@ -11,6 +11,9 @@ dependencies = [
     "psycopg[binary]>=3.2.3",
     "alembic>=1.13.3",
     "caspian-sdk>=0.6.1",
+    "langgraph>=1.2.10",
+    "langchain-anthropic>=1.5.3",
+    "pydantic>=2.13.4",
 ]
 
 [dependency-groups]
