@@ -1205,7 +1205,7 @@ git commit -m "feat(relay): add group-chat relay pipeline"
 - Test: `apps/server/tests/relay/test_personal_pipeline.py`
 
 **Interfaces:**
-- Produces: `app.relay.personal_pipeline.run_personal_relay(relay_llm, client, db: Session, *, message_id: int, channel: str, sender_handle: str, subject: str | None, text: str | None) -> None`. Never raises.
+- Produces: `app.relay.personal_pipeline.run_personal_relay(relay_llm, client, db: Session, *, connection_id: str, message_id: int, channel: str, sender_handle: str, conversation_id: str | None, subject: str | None, text: str | None) -> None`. Never raises. `conversation_id` is checked against pending `RelayRequest` rows first (reply-correlation, reusing v1's `RelayRequest` model — kept around by Task 8 specifically for this) before any other branching, since a dispatched relay's reply arrives back on the same shared relay-sender connection as a new inbound message.
 - Consumes: `app.relay.schemas.RelayExtractionResult` (Task 5's updated version), `app.relay.auth.verify_employment_id` (v1, unchanged), `app.relay.dispatcher.send_relay`/`resolve_identity_address`/`deliver_reply` (v1, unchanged), `app.departments.registry.resolve_target` (Task 2), `app.models.pending_verification.PendingVerification` (Task 1), `app.ingest.sender_resolution.resolve_sender` (existing, unchanged).
 
 This is the task that implements the new "ask for employee ID as a follow-up" stateful flow — the single most novel piece of logic in this plan. Read `apps/server/app/relay/pipeline.py` (v1's now-superseded single-scope pipeline, deleted in Task 8) for the established patterns this reuses: the top-level `try/except` never-raises safety net, `_safe_deliver_reply`-style helper, and the verification-gate shape (`claims_employee`/`employment_id`/`verified_employee` caching) — all identical here, just restructured around the new hold-and-resume mechanic instead of v1's single-shot-only extraction.
@@ -1703,6 +1703,7 @@ def _relay_and_record(
                 relay_llm, client, db,
                 connection_id=relay_sender_connection_id,
                 message_id=message_id, channel=channel, sender_handle=sender_handle,
+                conversation_id=channel_ref,
                 subject=subject, text=text,
             )
     except Exception:
@@ -2206,7 +2207,7 @@ git commit -m "feat(ingest): rewire handler/worker to scope-aware department rou
 
 **Interfaces:** none new. `app.relay.schemas`/`llm`/`auth`/`dispatcher` are untouched — confirm via grep that nothing outside `app/relay/pipeline.py` (being deleted) and `app/ingest/identities.py` (being deleted) references anything fixed-identity-specific before deleting.
 
-`RelayRequest` (v1's model, tracking a pending relay-and-reply-correlation) is **kept**, not deleted — the group-chat and personal-DM pipelines built in Tasks 5-6 don't use it (group-chat delivery doesn't need reply correlation the way v1's email-based relay did — group-chat replies are just normal follow-up messages in the same channel; personal-DM replies come back via the shared relay-sender connection's own conversation, which this plan didn't build correlation for). Cross-check with the spec before deleting: if reply-correlation for personal-DM relays turns out to be needed (a real gap this plan may have under-specified — flag it in your report if so, don't silently add it), `RelayRequest`'s existing shape (source message, target, conversation id, status) is the right foundation to reuse rather than re-designing. For now, leave the model in place, unused by new code, rather than deleting something that may be needed imminently.
+`RelayRequest` (v1's model, tracking a pending relay-and-reply-correlation) is **kept**, not deleted — it turned out to be needed after all: Task 6's `run_personal_relay` uses it directly for personal-DM reply-correlation (a gap caught during Task 6's own review — the model's original anticipation of this need, noted below, turned out correct). Group-chat delivery still doesn't use it (group-chat replies are just normal follow-up messages in the same channel, no correlation needed). Simply confirm via grep that `app.models.relay_request` is imported by `app/relay/personal_pipeline.py` before this task runs, and leave the model in place.
 
 - [ ] **Step 1: Verify nothing outside the doomed files depends on them**
 
