@@ -13,11 +13,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/departments", tags=["admin"])
 
 # Maps a platform name to the CommClient method that installs/connects it.
-# Only "slack"/"discord" use the one-click install_*() flow today - email
-# and telegram need different args (username/bot_token) this endpoint
-# doesn't collect yet, so they're deliberately not supported here. Extend
-# this dict (and _install_platform_connection's kwargs) when that's needed.
-_INSTALL_METHODS = {"slack": "install_slack", "discord": "install_discord"}
+# Only "slack" uses the one-click install_*() flow today. Discord's real
+# CommClient method is `connect_discord`, which needs a `username=` kwarg
+# this endpoint doesn't collect yet (see app/ingest/identities.py for the
+# live-verified method names) - and email/telegram need different args
+# (username/bot_token) too, so they're deliberately not supported here.
+# Extend this dict (and _install_platform_connection's kwargs) when that's
+# needed rather than silently mismapping a platform to the wrong method.
+_INSTALL_METHODS = {"slack": "install_slack"}
 
 
 class DepartmentCreateRequest(BaseModel):
@@ -38,21 +41,51 @@ class DepartmentResponse(BaseModel):
     requires_verification: bool
 
 
+class ChannelResolutionError(ValueError):
+    """Raised by `_resolve_channel_ref` when no exact channel match (or more
+    than one) is found. Its message carries the connection_id and visible-
+    conversation counts, which are useful for server-side logs and direct
+    callers/tests of `provision_department` but must NOT be echoed to HTTP
+    callers - see `create_department`'s exception handling below."""
+
+
+def _normalize_channel_name(name: str) -> str:
+    """Lowercases and strips a leading '#' so "finance" and "#Finance"
+    compare equal."""
+    return name.lower().lstrip("#")
+
+
 def _resolve_channel_ref(client, connection_id: str, channel_name: str) -> str:
     """Finds the conversation matching `channel_name` on this connection.
     NOT LIVE-VERIFIED (see this plan's Global Constraints) - assumes
     list_conversations() returns dicts with an 'id' and a 'name'-like field
-    the admin's channel_name hint can be matched against. Raises a clear
-    error (not a silent guess) if nothing matches, since the two most likely
-    causes - bot not yet invited to the channel, or a typo'd channel_name -
-    both need a human to notice and fix, not a fallback to guess at."""
+    the admin's channel_name hint can be matched against. Matches on exact
+    normalized equality (case-insensitive, leading '#' stripped from both
+    sides) rather than substring - a substring match could silently match
+    an admin's "finance" to an unrelated "finance-leaks-test" channel, or
+    let anyone who can name a channel in the workspace hijack a department's
+    routing. Raises a clear error (not a silent guess) if nothing matches -
+    or if more than one conversation shares the exact normalized name, since
+    that's ambiguous and picking the first would be a guess - since the
+    likely causes (bot not yet invited to the channel, a typo'd
+    channel_name, or a workspace naming collision) all need a human to
+    notice and fix, not a fallback to guess at."""
     conversations = client.list_conversations(connection_id)
-    channel_name_lower = channel_name.lower()
-    for conversation in conversations:
-        name = conversation.get("name") or ""
-        if channel_name_lower in name.lower():
-            return conversation["id"]
-    raise ValueError(
+    target = _normalize_channel_name(channel_name)
+    matches = [
+        conversation
+        for conversation in conversations
+        if _normalize_channel_name(conversation.get("name") or "") == target
+    ]
+    if len(matches) == 1:
+        return matches[0]["id"]
+    if len(matches) > 1:
+        raise ChannelResolutionError(
+            f"Ambiguous channel_name={channel_name!r}: {len(matches)} conversations "
+            f"on connection {connection_id!r} share that exact name - "
+            "rename one of them or disambiguate before retrying"
+        )
+    raise ChannelResolutionError(
         f"No conversation matching channel_name={channel_name!r} found on "
         f"connection {connection_id!r} ({len(conversations)} conversation(s) "
         "visible) - invite the bot to the channel first, then retry"
@@ -63,7 +96,8 @@ def _install_platform_connection(client, platform: str) -> str:
     method_name = _INSTALL_METHODS.get(platform)
     if method_name is None:
         raise ValueError(
-            f"Unsupported platform {platform!r} - supported: {sorted(_INSTALL_METHODS)}"
+            f"Platform {platform!r} is not yet supported by this endpoint - "
+            f"supported: {sorted(_INSTALL_METHODS)}"
         )
     connection = getattr(client, method_name)()
     return connection["id"]
@@ -125,7 +159,18 @@ def create_department(
             lead_email=payload.lead_email, platform=payload.platform,
             channel_name=payload.channel_name,
         )
+    except ChannelResolutionError as exc:
+        # The precise message (connection_id, visible-conversation counts,
+        # etc.) is logged server-side only - echoing it back to the HTTP
+        # caller would leak internal Caspian connection identifiers and
+        # workspace visibility info to whoever hits this endpoint.
+        logger.exception("Failed to provision department %r", payload.team_name)
+        raise HTTPException(
+            status_code=400, detail="Channel not found or bot not invited to it"
+        ) from exc
     except ValueError as exc:
+        # Other ValueErrors (e.g. an unsupported platform) don't carry
+        # sensitive internal details, so it's safe to pass them through.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to provision department %r", payload.team_name)
