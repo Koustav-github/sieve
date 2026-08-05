@@ -20,7 +20,7 @@ Two follow-up sub-projects, deferred out of this one:
 
 ## Goals
 
-- Let an admin register a new department (team name, lead name, lead email, platform) via an API call that immediately provisions a live Caspian connection for that department's group chat — usable right away, no worker restart.
+- Let an admin register a new department (team name, lead name, lead email, platform, and which channel on that platform is theirs) via an API call — usable right away, no worker restart. The first department on a given platform provisions that platform's shared Caspian connection; later departments on the same platform reuse it.
 - Route every inbound message down one of two paths based on where it arrived: **group chat** (the connection matches a registered department) or **personal DM** (the bot's own 1:1 presence).
 - Group-chat path: detect an explicit bot-directed relay request via one LLM call, resolve the extracted target against the live `departments` table (open vocabulary), skip ID verification, and deliver into the target department's own group chat. Unmatched/ambiguous target falls back to *the* exempt department — this assumes exactly one `departments` row has `requires_verification = False` at any time; if none is registered, reply that the team wasn't recognized instead of falling back to nothing. (If more than one exempt department ever exists, which one wins is undefined here — flag it as a data-integrity concern for the implementation plan, e.g. enforce it with a partial unique index, rather than picking silently.)
 - Personal-DM path: treat every message as an implicit request. Extract target + query text + (if present) an employee ID in one LLM call. Gate non-exempt targets behind employment-ID verification (cached on `PersonEntity`, same as v1). If unverified and no ID was given, hold the query and ask for one as a follow-up turn; the next message from that sender is checked against the held query before anything else.
@@ -41,11 +41,13 @@ Two follow-up sub-projects, deferred out of this one:
 apps/server/app/
 ├── departments/
 │   ├── __init__.py
-│   ├── models.py         # Department, PendingVerification ORM models
+│   ├── models.py         # PlatformConnection, Department, PendingVerification ORM models
 │   ├── registry.py        # get_department(team_name), list_departments(),
-│   │                       #   resolve_target(extracted_text) -> Department | None
-│   └── admin_api.py        # POST /admin/departments — writes the row AND
-│                            #   provisions the live Caspian connection
+│   │                       #   resolve_target(extracted_text) -> Department | None,
+│   │                       #   match_group_message(connection_id, channel_ref) -> Department | None
+│   └── admin_api.py        # POST /admin/departments — writes the row, provisioning
+│                            #   a new platform_connections row (live Caspian call) only
+│                            #   if this platform has no connection yet
 ├── relay/
 │   ├── ... (v1's schemas.py/llm.py/auth.py/dispatcher.py stay, extended)
 │   ├── scope.py            # NEW: classify_scope(message) -> "group" | "personal"
@@ -56,11 +58,13 @@ apps/server/app/
 
 `app/ingest/worker.py`/`handler.py` keep their overall shape (one `CommClient`, one handler, one `listen()` loop, async executor) but the handler's dispatch-to-pipeline step branches on `scope.classify_scope(message)` instead of always calling one `run_relay`. The `connection_identities`-style dict v1 built once at startup from `register_identities()` is replaced, for departments, by a live (short-cached) DB lookup — so a department registered mid-run is immediately routable.
 
-**Open, not yet live-verified** (same class of uncertainty v1's `dispatcher.py` already documented and handled by failing loud rather than guessing): (1) how Caspian's message payload distinguishes a group-channel message from a personal-DM message — needed for `scope.classify_scope`; (2) the right Caspian SDK call for "deliver this into department X's own group chat" as opposed to `initiate()`'s cold-start-a-conversation-with-a-recipient shape, which fits the email path but not an existing channel. Both need one live check against the sandbox before implementation locks in the exact call.
+**Connection model** (clarified during brainstorming): platforms like Slack/Discord are installed once per workspace, not once per department — so multiple departments on the same platform share one `platform_connections` row, and are distinguished by `departments.channel_ref` (their specific channel/conversation within that shared connection). Registering the *first* department on a platform provisions a new connection (`install_slack()`/`connect_discord()`/etc.); registering a subsequent department on an already-connected platform reuses the existing `platform_connections` row and just records the new department's `channel_ref`.
+
+**Open, not yet live-verified** (same class of uncertainty v1's `dispatcher.py` already documented and handled by failing loud rather than guessing): (1) how a specific Slack/Discord *channel* maps to a stable, obtainable identifier at registration time (does Caspian expose a `conversation_id`/channel id per channel via `list_conversations()` before any message has been sent there, or does a conversation only get an id once a message actually flows through it?) — this determines exactly how `channel_ref` gets populated when an admin registers a department; (2) how Caspian's message payload identifies which channel/conversation an inbound group message belongs to — needed to match an inbound message against a department's `channel_ref` (`Message.conversation_id` is the leading candidate, confirmed to exist on the real SDK dataclass, but whether it's stable/pre-obtainable per (1) needs the same live check); (3) the right Caspian SDK call for "deliver this into department X's own group chat" as opposed to `initiate()`'s cold-start-a-conversation-with-a-recipient shape, which fits the email path but not an existing channel. All three need one live check against the sandbox before implementation locks in the exact calls.
 
 ## Data flow
 
-**Group-chat path** (inbound connection_id matches some `departments.connection_id`):
+**Group-chat path** (inbound message's connection + channel-within-connection matches some `departments` row's `platform_connection_id` + `channel_ref`):
 1. One LLM call: is this message a bot-directed relay request, and if so, what target + what text? Not a request → ignore, nothing happens.
 2. Is a request → resolve extracted target text against the live `departments` table. No match/ambiguous → falls back to the one department with `requires_verification = False` (see Goals for what happens if zero or more than one exists).
 3. No ID check. Deliver into the target department's own group chat (mechanism TBD, see Architecture's open item).
@@ -76,13 +80,22 @@ apps/server/app/
 ## Data model
 
 ```
+platform_connections
+  id                PK
+  platform          UNIQUE, text (slack | discord | telegram | email)
+  connection_id      text — the one shared Caspian connection for this platform
+                      (e.g. one Slack workspace install serves every Slack department)
+
 departments
   id                     PK
   team_name              UNIQUE, text
   lead_name              text
   lead_email             text
-  platform                text (slack | discord | telegram | email)
-  connection_id            text — Caspian connection for this dept's own group chat
+  platform_connection_id  FK -> platform_connections.id
+  channel_ref             text — identifies THIS department's specific channel/
+                           conversation within the shared platform connection
+                           (e.g. a Slack channel/conversation id) — see Architecture's
+                           open item on how this is obtained/stays stable
   requires_verification     bool, default True
   created_at
 
@@ -103,7 +116,7 @@ pending_verifications
 - **Pending verification never completed**: no timeout, no expiry — same philosophy as v1's indefinite reply-wait.
 - **A second query arrives while one is still pending verification for that sender**: newer request replaces the held one (upsert on the `UNIQUE(sender_handle, channel)` constraint) — one outstanding ask per person at a time.
 - **Group-to-group delivery fails**: reply with an error into the *source* group chat, mirroring v1's dispatch-failure handling.
-- **Admin registers a department but the live Caspian `connect_*()` call fails**: the endpoint must not leave a half-created row — roll back the DB write, return an error to the admin caller.
+- **Admin registers the first department on a platform but the live Caspian `connect_*()`/`install_*()` call fails**: the endpoint must not leave a half-created row — roll back the DB write (both the new `platform_connections` row, if one was being created, and the `departments` row), return an error to the admin caller. Registering a department on an *already-connected* platform has no live Caspian call to fail — it's a pure DB write.
 - **The two flagged live-SDK unknowns** (group-vs-DM detection, group delivery call): fail loud with a clear error rather than guess silently, exactly like v1's `dispatcher.py` documented uncertainty pattern — pin down with one live check before this ships.
 
 ## Testing
