@@ -1,0 +1,4 @@
+1. Registered Users (Some Lead of some domain) -> On Company database who are authorized to recieve queries from around platforms.
+2. bots deployed on different platform to recieve queries and answers.
+3. only users with employee id will be able to send queries and answers(except customer support).
+4. now example: an employee asked for "hey @bot ask the finance team to give me the sales report first quarter of 2026" (on Slack)(Either by tagging or in the bot chat) -> bot is asked for employee id -> looks up the database -> if exists -> sends the query to the pipeline -> agents examine the query -> tries to answer if data exists in the database (knowledge graph) -> else forward it smoothly to responsible team on the platform whose credentials are connected in the gateway -> then the response: "here is the data u asked for" -> agents examine the response and deliver it back in the same path it came from (this path has to be figured out). One round trip loop complete.
