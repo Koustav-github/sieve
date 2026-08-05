@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, String, UniqueConstraint, func
+from sqlalchemy import JSON, DateTime, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -21,7 +21,3 @@ class Message(Base):
     thread_id: Mapped[str | None] = mapped_column(String, nullable=True)
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    fine_bucket: Mapped[str | None] = mapped_column(String, nullable=True)
-    classified_by: Mapped[str | None] = mapped_column(String, nullable=True)
-    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
-    classified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
