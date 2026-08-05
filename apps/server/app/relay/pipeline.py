@@ -22,6 +22,9 @@ UNVERIFIED_REPLY_TEXT = (
 DISPATCH_FAILURE_REPLY_TEXT = (
     "Sorry, we couldn't relay your message right now. Please try again shortly."
 )
+SELF_RELAY_REPLY_TEMPLATE = (
+    "You're already speaking directly with {target_identity} - no relay needed."
+)
 
 
 def run_relay(
@@ -154,6 +157,29 @@ def _dispatch(
     target_identity: str,
     message_text: str,
 ) -> None:
+    if target_identity == agent_identity:
+        # E.g. a customer emailing support@ who asks "please pass this to
+        # support" would extract target_identity="support" while
+        # agent_identity is already "support". Dispatching anyway would send
+        # an outbound relay email from the identity's own connection back to
+        # its own address, which on re-ingest arrives with the same
+        # agent_identity as this request's source_identity - the
+        # reply-correlation check in run_relay would then treat the relay's
+        # own outbound text as "the reply" and silently complete the
+        # request with no human ever having seen it.
+        logger.warning(
+            "Refusing to relay message %s: target_identity == agent_identity (%r)",
+            message_id,
+            target_identity,
+        )
+        _safe_deliver_reply(
+            client,
+            db,
+            message_id,
+            SELF_RELAY_REPLY_TEMPLATE.format(target_identity=target_identity),
+        )
+        return
+
     source_connection = identity_email_connections.get(agent_identity)
     target_connection = identity_email_connections.get(target_identity)
     if source_connection is None or target_connection is None:
@@ -180,17 +206,30 @@ def _dispatch(
         _safe_deliver_reply(client, db, message_id, DISPATCH_FAILURE_REPLY_TEXT)
         return
 
-    db.add(
-        RelayRequest(
-            source_message_id=message_id,
-            source_identity=agent_identity,
-            target_identity=target_identity,
-            target_conversation_id=conversation_id,
-            message_text=message_text,
-            status="pending",
+    try:
+        db.add(
+            RelayRequest(
+                source_message_id=message_id,
+                source_identity=agent_identity,
+                target_identity=target_identity,
+                target_conversation_id=conversation_id,
+                message_text=message_text,
+                status="pending",
+            )
         )
-    )
-    db.commit()
+        db.commit()
+    except Exception:
+        # send_relay() already succeeded above - the message is out on the
+        # wire - but we failed to record the RelayRequest that a reply would
+        # need to correlate against. Roll back and tell the requester
+        # something went wrong instead of silently letting the top-level
+        # safety net in run_relay swallow this with no signal to anyone.
+        db.rollback()
+        logger.exception(
+            "Failed to record RelayRequest for message %s after successful send_relay",
+            message_id,
+        )
+        _safe_deliver_reply(client, db, message_id, DISPATCH_FAILURE_REPLY_TEXT)
 
 
 def _deliver_pending_reply(

@@ -117,7 +117,7 @@ def test_already_verified_employee_skips_reasking(db_session):
 
     run_relay(
         llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
-        message_id=message.id, agent_identity="internal", channel="slack",
+        message_id=message.id, agent_identity="careers", channel="slack",
         sender_handle="U-2", conversation_id="thread-1", subject=None, text="need sign-off",
     )
 
@@ -429,6 +429,63 @@ def test_unexpected_error_is_swallowed_by_top_level_safety_net(db_session, monke
 
     assert db_session.query(RelayRequest).count() == 0
     assert client.initiate_calls == []
+
+
+def test_dispatch_db_commit_failure_after_successful_send_replies_and_rolls_back(
+    db_session, monkeypatch
+):
+    # send_relay() succeeds (message is already on the wire to the target)
+    # but recording the RelayRequest fails on commit - e.g. an IntegrityError
+    # from the target_conversation_id UniqueConstraint. The requester must
+    # still get a DISPATCH_FAILURE_REPLY_TEXT reply, and no RelayRequest row
+    # should survive.
+    message = _persist_source_message(db_session, caspian_message_id="msg-src-12")
+
+    llm = _FakeLLM(RelayExtractionResult(
+        is_relay_request=True, target_identity="support", message_text="need help",
+    ))
+    client = _FakeClient(initiate_response={"conversation_id": "conv-commit-fail"})
+
+    def failing_commit():
+        raise RuntimeError("IntegrityError: duplicate target_conversation_id")
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+
+    run_relay(
+        llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
+        message_id=message.id, agent_identity="internal", channel="slack",
+        sender_handle="U-12", conversation_id="thread-1", subject=None, text="need help",
+    )
+
+    assert client.initiate_calls == [("conn-internal", "support@sieve.test", "need help")]
+    assert db_session.query(RelayRequest).count() == 0
+    assert client.reply_calls == [("msg-src-12", DISPATCH_FAILURE_REPLY_TEXT)]
+
+
+def test_self_relay_target_equals_agent_identity_replies_without_dispatch(db_session):
+    # A customer emailing support@ asking "please pass this to support"
+    # would extract target_identity="support" while agent_identity is
+    # already "support". This must be refused before dispatch, not sent out
+    # and looped back to itself as a fake "reply".
+    message = _persist_source_message(db_session, caspian_message_id="msg-src-13")
+
+    llm = _FakeLLM(RelayExtractionResult(
+        is_relay_request=True, target_identity="support",
+        message_text="please forward this to support",
+    ))
+    client = _FakeClient()
+
+    run_relay(
+        llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
+        message_id=message.id, agent_identity="support", channel="email",
+        sender_handle="someone@customer.test", conversation_id="thread-1",
+        subject=None, text="please forward this to support",
+    )
+
+    assert db_session.query(RelayRequest).count() == 0
+    assert client.initiate_calls == []
+    assert len(client.reply_calls) == 1
+    assert client.reply_calls[0][0] == "msg-src-13"
 
 
 def test_caspian_message_id_returns_none_for_missing_message(db_session):

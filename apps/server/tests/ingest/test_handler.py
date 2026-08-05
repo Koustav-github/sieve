@@ -10,7 +10,7 @@ from app.models.person import PersonEntity
 from app.models.relay_request import RelayRequest
 from app.relay.schemas import RelayExtractionResult
 
-CONNECTION_IDENTITIES = {"conn-support": "support", "conn-200": "support"}
+CONNECTION_IDENTITIES = {"conn-support": "support", "conn-200": "support", "conn-careers": "careers"}
 
 IDENTITY_EMAIL_CONNECTIONS = {
     "careers": {"id": "conn-careers", "address": "careers@sieve.test"},
@@ -269,8 +269,13 @@ def test_handler_invokes_relay_and_persists_relay_request(session_factory):
                 employment_id=None,
             )
 
+    # connection_id is "conn-careers" (not "conn-support") so agent_identity
+    # ("careers") differs from the LLM's extracted target_identity
+    # ("support") - otherwise this would hit the target_identity ==
+    # agent_identity self-relay guard (Finding 4) and no RelayRequest would
+    # be created.
     handle = _build_handler(session_factory, relay_llm=_RelayLLM())
-    handle(_fake_message(id="msg-300"))
+    handle(_fake_message(id="msg-300", connection_id="conn-careers"))
 
     db = session_factory()
     try:

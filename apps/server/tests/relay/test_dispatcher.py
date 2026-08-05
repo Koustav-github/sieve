@@ -28,12 +28,24 @@ def test_resolve_identity_address_falls_back_to_email_key():
 
 
 def test_resolve_identity_address_falls_back_to_username_key():
-    assert resolve_identity_address({"id": "conn-1", "username": "internal"}) == "internal"
+    assert (
+        resolve_identity_address({"id": "conn-1", "username": "internal@sieve.test"})
+        == "internal@sieve.test"
+    )
 
 
 def test_resolve_identity_address_raises_when_no_known_key():
     with pytest.raises(KeyError):
         resolve_identity_address({"id": "conn-1"})
+
+
+def test_resolve_identity_address_raises_when_username_is_not_an_email():
+    # resolve_identity_address is only ever called for email connections -
+    # a bare "username" value with no "@" (e.g. a Caspian-shape mismatch
+    # returning a display handle instead of an address) must not be
+    # silently returned as if it were a valid recipient.
+    with pytest.raises(KeyError):
+        resolve_identity_address({"id": "conn-1", "username": "careers"})
 
 
 def test_send_relay_calls_initiate_and_returns_conversation_id():

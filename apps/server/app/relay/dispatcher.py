@@ -10,12 +10,26 @@ def resolve_identity_address(connection: dict) -> str:
     module's docstring note in the implementation plan re: the exact key
     not being live-verified - tries the plausible candidates in order and
     raises loudly on a shape mismatch instead of silently sending to an
-    empty recipient."""
+    empty recipient.
+
+    This is only ever called for email connections (relay dispatch always
+    goes out over email), so a found value is additionally required to look
+    like an email address (contains "@") before it's returned - a bare
+    "username" value (no "@") is rejected and the remaining candidate keys
+    are tried instead, so we never silently send to an obviously-invalid
+    recipient."""
+    rejected: list[tuple[str, Any]] = []
     for key in ADDRESS_KEYS:
         value = connection.get(key)
-        if value:
+        if not value:
+            continue
+        if "@" in value:
             return value
-    raise KeyError(f"connection dict has none of {ADDRESS_KEYS}: {connection!r}")
+        rejected.append((key, value))
+    raise KeyError(
+        f"connection dict has none of {ADDRESS_KEYS} containing '@' "
+        f"(rejected non-email candidates: {rejected!r}): {connection!r}"
+    )
 
 
 def send_relay(client: Any, *, connection_id: str, recipient: str, text: str) -> str:
