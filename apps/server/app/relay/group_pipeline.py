@@ -49,6 +49,12 @@ def run_group_relay(
         if target is None:
             target = get_exempt_department(db)
         if target is None:
+            # Genuine no-match (get_exempt_department returned None, i.e.
+            # zero exempt departments exist): tell the sender. Contrast the
+            # get_exempt_department() call above raising RuntimeError (more
+            # than one exempt department - a data-integrity misconfiguration)
+            # which is caught only by the outer safety net below and
+            # deliberately does NOT reply - see that except block.
             _safe_reply(client, db, message_id, NO_MATCH_REPLY_TEXT)
             return
 
@@ -57,6 +63,10 @@ def run_group_relay(
             return
 
         try:
+            # target.channel_ref is passed as conversation_id on the
+            # assumption they're the same identifier - unverified against a
+            # live caspian_sdk.CommClient.send_message call (see plan's
+            # flagged uncertainty #3); confirm before this ships.
             client.send_message(target.channel_ref, text=message_text)
         except Exception:
             logger.exception("Failed to deliver group relay for message %s", message_id)
