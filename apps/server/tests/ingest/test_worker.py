@@ -19,9 +19,7 @@ class _FakeClient:
 def _patch_common(monkeypatch, session_factory, fake_client):
     monkeypatch.setattr(worker_module, "CommClient", lambda: fake_client)
     monkeypatch.setattr(worker_module, "SessionLocal", session_factory)
-    monkeypatch.setattr(worker_module, "build_l3_llm", lambda: object())
-    monkeypatch.setattr(worker_module, "build_subject_extraction_llm", lambda: object())
-    monkeypatch.setattr(worker_module.settings, "anthropic_api_key", "test-anthropic-key")
+    monkeypatch.setattr(worker_module, "build_relay_llm", lambda: object())
 
 
 def test_main_reaches_listen_with_partial_registration_failures(monkeypatch, session_factory):
@@ -69,7 +67,7 @@ def test_main_raises_when_every_channel_fails(monkeypatch, session_factory):
     assert fake_client.listen_called is False
 
 
-def test_main_raises_when_results_empty(monkeypatch):
+def test_main_raises_when_results_empty(monkeypatch, session_factory):
     """An empty results dict means no identity has resolved email coverage -
     the "every channel failed" shortcut doesn't fire (nothing to call
     "failed"), but validate_identity_coverage() must still refuse to start
@@ -84,7 +82,7 @@ def test_main_raises_when_results_empty(monkeypatch):
     assert fake_client.listen_called is False
 
 
-def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch):
+def test_main_raises_when_email_identity_already_registered_with_no_others(monkeypatch, session_factory):
     """A 409 (ALREADY_REGISTERED) on an identity's email gives us no
     connection_id to route on. Per the live-verified idempotency of
     connect_email() (see identities.py), a real restart returns the same
@@ -109,3 +107,39 @@ def test_main_raises_when_email_identity_already_registered_with_no_others(monke
         worker_module.main()
 
     assert fake_client.listen_called is False
+
+
+def test_main_builds_identity_email_connections_from_email_results_only(monkeypatch, session_factory):
+    """The dict threaded into build_on_message_handler for relay dispatch
+    must contain only the email connections (relay always goes out over
+    email - see Global Constraints), keyed by identity, not by (identity,
+    channel), and must exclude non-dict results (None/ALREADY_REGISTERED)
+    and non-email channels."""
+    fake_client = _FakeClient()
+    _patch_common(monkeypatch, session_factory, fake_client)
+    monkeypatch.setattr(
+        worker_module,
+        "register_identities",
+        lambda client: {
+            ("careers", "email"): {"id": "conn-careers-email"},
+            ("support", "email"): {"id": "conn-support-email"},
+            ("support", "telegram"): {"id": "conn-support-telegram"},
+            ("internal", "email"): {"id": "conn-internal-email"},
+            ("internal", "slack"): None,
+        },
+    )
+    captured = {}
+
+    def fake_build_on_message_handler(session_factory_arg, connection_identities, relay_llm, executor, client, identity_email_connections):
+        captured["identity_email_connections"] = identity_email_connections
+        return lambda message: None
+
+    monkeypatch.setattr(worker_module, "build_on_message_handler", fake_build_on_message_handler)
+
+    worker_module.main()
+
+    assert captured["identity_email_connections"] == {
+        "careers": {"id": "conn-careers-email"},
+        "support": {"id": "conn-support-email"},
+        "internal": {"id": "conn-internal-email"},
+    }

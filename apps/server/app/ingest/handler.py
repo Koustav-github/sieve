@@ -7,10 +7,9 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.classify.pipeline import run_classification
 from app.ingest.message_store import is_duplicate, persist_message
 from app.ingest.sender_resolution import resolve_sender
-from app.models.message import Message
+from app.relay.pipeline import run_relay
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +23,8 @@ def _field(message: Any, *names: str) -> Any:
 
 
 def _raw_payload(message: Any) -> dict[str, Any]:
-    """Capture the full raw message for downstream use (e.g. the classification
-    sub-project needs `subject` - it's the primary bucketing signal for email).
+    """Capture the full raw message for downstream use (e.g. subject is a
+    signal for the relay-detection LLM).
 
     Prefers ``dataclasses.fields()`` so this stays correct against the real
     ``caspian_sdk.client.Message`` dataclass (id, conversation_id,
@@ -46,41 +45,44 @@ def _raw_payload(message: Any) -> dict[str, Any]:
     return {key: value for key, value in data.items() if not key.startswith("_")}
 
 
-def _classify_and_record(
+def _relay_and_record(
     session_factory: Callable[[], Session],
-    classification_graph: Any,
+    relay_llm: Any,
+    client: Any,
+    identity_email_connections: dict[str, dict],
     *,
     message_id: int,
     agent_identity: str,
+    channel: str,
     sender_handle: str,
+    conversation_id: str | None,
     subject: str | None,
     text: str | None,
 ) -> None:
     """Runs on `executor`'s worker thread, off the ingest `listen()` loop -
     opens its own `Session` (the handler's session belongs to a different
-    thread and is closed by the time this runs). Never raises: a
-    classification failure here must not affect ingestion, which already
-    completed successfully before this was submitted."""
+    thread and is closed by the time this runs). Never raises: a relay
+    failure here must not affect ingestion, which already completed
+    successfully before this was submitted."""
     db = session_factory()
     try:
-        message = db.get(Message, message_id)
-        if message is None:
-            logger.error("Classification skipped: message %s no longer exists", message_id)
-            return
-        run_classification(
-            classification_graph,
+        run_relay(
+            relay_llm,
+            client,
             db,
-            message=message,
+            identity_email_connections,
+            message_id=message_id,
             agent_identity=agent_identity,
+            channel=channel,
             sender_handle=sender_handle,
+            conversation_id=conversation_id,
             subject=subject,
             text=text,
         )
     except Exception:
         db.rollback()
         logger.exception(
-            "Async classification failed for message %s; message was still "
-            "ingested successfully",
+            "Async relay failed for message %s; message was still ingested successfully",
             message_id,
         )
     finally:
@@ -90,22 +92,23 @@ def _classify_and_record(
 def build_on_message_handler(
     session_factory: Callable[[], Session],
     connection_identities: dict[str, str],
-    classification_graph: Any,
+    relay_llm: Any,
     executor: Executor,
+    client: Any,
+    identity_email_connections: dict[str, dict],
 ) -> Callable[[Any], None]:
     """`connection_identities` maps a Caspian `connection_id` to one of
     Sieve's 3 fixed identities ("careers"/"support"/"internal") - see
     `app.ingest.identities.connection_identity_map`. The real
     `caspian_sdk.client.Message.agent_id` is Caspian's own platform-internal
     id (assigned even when we don't request one) and is NOT one of Sieve's
-    identity labels, so it cannot be used as the coarse bucket - the
+    identity labels, so it cannot be used as the coarse identity - the
     connection the message arrived on is the only reliable signal.
 
-    `classification_graph` is a compiled graph from
-    `app.classify.graph.build_classification_graph` - submitted to
-    `executor` once per message, after it's durably persisted, to run the
-    L1/L3/subject-extraction cascade and record a `RoutingDecision` off the
-    ingest `listen()` loop, so LLM latency never blocks message intake.
+    `relay_llm`/`client`/`identity_email_connections` are submitted to
+    `executor` once per message, after it's durably persisted, to run
+    `app.relay.pipeline.run_relay` off the ingest `listen()` loop, so LLM
+    and outbound-send latency never blocks message intake.
     """
 
     def handle(message: Any) -> None:
@@ -128,7 +131,6 @@ def build_on_message_handler(
             # robustness against the simpler fake message objects tests use.
             thread_id = _field(message, "conversation_id", "thread_id")
             sender = getattr(message, "sender", None) or {}
-            # Extract sender handle with fallback keys for flexibility
             if isinstance(sender, dict):
                 sender_handle = sender.get("address") or sender.get("email") or sender.get("handle")
             else:
@@ -158,12 +160,16 @@ def build_on_message_handler(
             db.commit()
 
             executor.submit(
-                _classify_and_record,
+                _relay_and_record,
                 session_factory,
-                classification_graph,
+                relay_llm,
+                client,
+                identity_email_connections,
                 message_id=persisted_message.id,
                 agent_identity=agent_id,
+                channel=channel,
                 sender_handle=sender_handle,
+                conversation_id=thread_id,
                 subject=_field(message, "subject"),
                 text=_field(message, "text"),
             )

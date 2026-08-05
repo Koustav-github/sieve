@@ -3,8 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 from caspian_sdk import CommClient
 
-from app.classification.classifier import classify as classify_message
-from app.classification.clients import build_groq_client, build_pinecone_client
 from app.db.session import SessionLocal
 from app.ingest.handler import build_on_message_handler
 from app.ingest.identities import (
@@ -12,14 +10,15 @@ from app.ingest.identities import (
     register_identities,
     validate_identity_coverage,
 )
+from app.relay.llm import build_relay_llm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Classification runs off the ingest listen() loop (see handler._classify_and_record)
-# so LLM latency never blocks message intake; bounded to avoid unbounded thread
-# growth under a burst of messages.
-CLASSIFICATION_EXECUTOR_WORKERS = 4
+# Relay dispatch/LLM detection runs off the ingest listen() loop (see
+# handler._relay_and_record) so latency never blocks message intake;
+# bounded to avoid unbounded thread growth under a burst of messages.
+RELAY_EXECUTOR_WORKERS = 4
 
 
 def main() -> None:
@@ -45,15 +44,28 @@ def main() -> None:
     logger.info("connection -> identity map: %r", connection_identities)
     validate_identity_coverage(results, connection_identities)
 
-    executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sieve-classify")
-    pinecone_client = build_pinecone_client()
-    groq_client = build_groq_client()
+    # Relay dispatch always goes out over email (the one channel all 3
+    # identities share - see IDENTITY_CHANNELS in identities.py), using each
+    # identity's own already-registered connection as both the "send from"
+    # (source) and "send to" (target) address - see app.relay.dispatcher.
+    identity_email_connections = {
+        identity: result
+        for (identity, channel), result in results.items()
+        if channel == "email" and isinstance(result, dict)
+    }
 
-    def submit_classification(message_id: int) -> None:
-        executor.submit(classify_message, SessionLocal, pinecone_client, groq_client, message_id)
+    executor = ThreadPoolExecutor(max_workers=RELAY_EXECUTOR_WORKERS, thread_name_prefix="sieve-relay")
+    relay_llm = build_relay_llm()
 
     client.on_message(
-        build_on_message_handler(SessionLocal, connection_identities, submit_classification)
+        build_on_message_handler(
+            SessionLocal,
+            connection_identities,
+            relay_llm,
+            executor,
+            client,
+            identity_email_connections,
+        )
     )
     logger.info("Sieve ingestion worker listening...")
     client.listen()
