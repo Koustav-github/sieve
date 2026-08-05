@@ -9,7 +9,9 @@ from sqlalchemy.orm import Session
 
 from app.ingest.message_store import is_duplicate, persist_message
 from app.ingest.sender_resolution import resolve_sender
-from app.relay.pipeline import run_relay
+from app.relay.group_pipeline import run_group_relay
+from app.relay.personal_pipeline import run_personal_relay
+from app.relay.scope import classify_scope
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +29,11 @@ def _raw_payload(message: Any) -> dict[str, Any]:
     signal for the relay-detection LLM).
 
     Prefers ``dataclasses.fields()`` so this stays correct against the real
-    ``caspian_sdk.client.Message`` dataclass (id, conversation_id,
-    connection_id, customer_id, agent_id, channel, sender, subject, text,
-    html, media, ...) without hand-picking fields that will drift as the SDK
-    evolves. Falls back to ``vars()`` for the simple fake message objects
-    (``SimpleNamespace``) used in tests, which aren't real dataclasses.
-    Drops any leading-underscore attribute either way - in particular
-    ``_client`` on the real ``Message``, which holds a live SDK client and
+    ``caspian_sdk.client.Message`` dataclass without hand-picking fields
+    that will drift as the SDK evolves. Falls back to ``vars()`` for the
+    simple fake message objects (``SimpleNamespace``) used in tests, which
+    aren't real dataclasses. Drops any leading-underscore attribute either
+    way - in particular ``_client``, which holds a live SDK client and
     isn't serializable.
     """
     try:
@@ -49,13 +49,13 @@ def _relay_and_record(
     session_factory: Callable[[], Session],
     relay_llm: Any,
     client: Any,
-    identity_email_connections: dict[str, dict],
+    relay_sender_connection_id: str,
     *,
     message_id: int,
-    agent_identity: str,
+    connection_id: str,
+    channel_ref: str | None,
     channel: str,
     sender_handle: str,
-    conversation_id: str | None,
     subject: str | None,
     text: str | None,
 ) -> None:
@@ -66,19 +66,21 @@ def _relay_and_record(
     successfully before this was submitted."""
     db = session_factory()
     try:
-        run_relay(
-            relay_llm,
-            client,
-            db,
-            identity_email_connections,
-            message_id=message_id,
-            agent_identity=agent_identity,
-            channel=channel,
-            sender_handle=sender_handle,
-            conversation_id=conversation_id,
-            subject=subject,
-            text=text,
-        )
+        scope, department = classify_scope(db, connection_id=connection_id, channel_ref=channel_ref)
+        if scope == "group":
+            run_group_relay(
+                relay_llm, client, db,
+                message_id=message_id, source_department=department,
+                subject=subject, text=text,
+            )
+        else:
+            run_personal_relay(
+                relay_llm, client, db,
+                connection_id=relay_sender_connection_id,
+                message_id=message_id, channel=channel, sender_handle=sender_handle,
+                conversation_id=channel_ref,
+                subject=subject, text=text,
+            )
     except Exception:
         db.rollback()
         logger.exception(
@@ -91,24 +93,21 @@ def _relay_and_record(
 
 def build_on_message_handler(
     session_factory: Callable[[], Session],
-    connection_identities: dict[str, str],
     relay_llm: Any,
     executor: Executor,
     client: Any,
-    identity_email_connections: dict[str, dict],
+    relay_sender_connection_id: str,
 ) -> Callable[[Any], None]:
-    """`connection_identities` maps a Caspian `connection_id` to one of
-    Sieve's 3 fixed identities ("careers"/"support"/"internal") - see
-    `app.ingest.identities.connection_identity_map`. The real
-    `caspian_sdk.client.Message.agent_id` is Caspian's own platform-internal
-    id (assigned even when we don't request one) and is NOT one of Sieve's
-    identity labels, so it cannot be used as the coarse identity - the
-    connection the message arrived on is the only reliable signal.
+    """Unlike v1, there's no fixed connection_id -> identity map built at
+    startup - `app.relay.scope.classify_scope` resolves group-chat
+    membership from the live `departments` table per message, so a
+    department registered after the worker started is immediately routable.
 
-    `relay_llm`/`client`/`identity_email_connections` are submitted to
-    `executor` once per message, after it's durably persisted, to run
-    `app.relay.pipeline.run_relay` off the ingest `listen()` loop, so LLM
-    and outbound-send latency never blocks message intake.
+    `agent_id` stored on the `messages` row is best-effort here: the
+    matched department's team_name for a group-chat message, or the
+    literal string "personal" for a personal-DM message (there's no
+    department a personal message "belongs to" until routing resolves
+    one) - see this plan's Decisions section.
     """
 
     def handle(message: Any) -> None:
@@ -125,27 +124,23 @@ def build_on_message_handler(
 
             channel = _field(message, "channel")
             connection_id = _field(message, "connection_id")
-            agent_id = connection_identities.get(connection_id) if connection_id else None
-            # The real caspian_sdk.Message has no `thread_id` - the field is
-            # `conversation_id`. Keep `thread_id` as a secondary fallback for
-            # robustness against the simpler fake message objects tests use.
-            thread_id = _field(message, "conversation_id", "thread_id")
+            channel_ref = _field(message, "conversation_id")
             sender = getattr(message, "sender", None) or {}
             if isinstance(sender, dict):
                 sender_handle = sender.get("address") or sender.get("email") or sender.get("handle")
             else:
                 sender_handle = None
 
-            if not (channel and agent_id and sender_handle):
+            if not (channel and connection_id and sender_handle):
                 logger.error(
                     "Dropping message %s: missing required field(s) "
-                    "(channel=%r agent_id=%r sender=%r)",
-                    message_id,
-                    channel,
-                    agent_id,
-                    sender_handle,
+                    "(channel=%r connection_id=%r sender=%r)",
+                    message_id, channel, connection_id, sender_handle,
                 )
                 return
+
+            scope, department = classify_scope(db, connection_id=connection_id, channel_ref=channel_ref)
+            agent_id = department.team_name if department is not None else "personal"
 
             resolve_sender(db, channel=channel, handle=sender_handle)
             persisted_message = persist_message(
@@ -154,7 +149,7 @@ def build_on_message_handler(
                 agent_id=agent_id,
                 channel=channel,
                 sender_handle=sender_handle,
-                thread_id=thread_id,
+                thread_id=channel_ref,
                 raw_payload=_raw_payload(message),
             )
             db.commit()
@@ -164,24 +159,16 @@ def build_on_message_handler(
                 session_factory,
                 relay_llm,
                 client,
-                identity_email_connections,
+                relay_sender_connection_id,
                 message_id=persisted_message.id,
-                agent_identity=agent_id,
+                connection_id=connection_id,
+                channel_ref=channel_ref,
                 channel=channel,
                 sender_handle=sender_handle,
-                conversation_id=thread_id,
                 subject=_field(message, "subject"),
                 text=_field(message, "text"),
             )
         except IntegrityError:
-            # Caspian's listen() can dispatch different conversations
-            # concurrently, so two first-contact messages from the same new
-            # sender can race on the channel_handles unique constraint - or a
-            # redelivery can slip past the is_duplicate() check above and
-            # race on messages.caspian_message_id instead. Either way the
-            # loser here is a valid message, not a bug - log it distinctly
-            # (no traceback) and treat it as "already processed" by dropping
-            # it, rather than as a crash-worthy failure.
             db.rollback()
             logger.warning(
                 "IntegrityError persisting message %s; likely a duplicate "
