@@ -12,8 +12,10 @@ class RelayExtractionResult(BaseModel):
     target_identity: str | None = Field(
         default=None,
         description=(
-            "One of 'careers', 'support', 'internal' - which identity the "
-            "sender wants this relayed to. None if is_relay_request is False."
+            "The name of the department the sender wants this relayed to "
+            "(e.g. 'finance', 'hr') - matched against the live department "
+            "registry by the caller, not validated here. None if "
+            "is_relay_request is False."
         ),
     )
     message_text: str | None = Field(
