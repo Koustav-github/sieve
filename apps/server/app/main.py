@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
 from app.core.config import settings
+from app.departments.admin_api import router as departments_router
 
 app = FastAPI(title="Sieve API")
 
@@ -14,3 +15,4 @@ app.add_middleware(
 )
 
 app.include_router(health_router)
+app.include_router(departments_router)
