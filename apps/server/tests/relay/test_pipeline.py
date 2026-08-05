@@ -2,7 +2,12 @@ from app.ingest.message_store import persist_message
 from app.models.employee import Employee
 from app.models.person import PersonEntity
 from app.models.relay_request import RelayRequest
-from app.relay.pipeline import run_relay
+from app.relay.pipeline import (
+    DISPATCH_FAILURE_REPLY_TEXT,
+    _caspian_message_id,
+    _safe_deliver_reply,
+    run_relay,
+)
 from app.relay.schemas import RelayExtractionResult
 
 
@@ -232,13 +237,18 @@ def test_employment_id_lookup_db_error_replies_and_falls_back_to_support(db_sess
 
 
 def test_reply_delivery_failure_leaves_request_pending(db_session):
+    # The reply to a relay we sent out lands back on the SOURCE identity's
+    # own connection (see run_relay's docstring / Finding 1): the message
+    # arrives with agent_identity == the relay's source_identity
+    # ("internal"), sent by whoever holds the target identity's own address
+    # ("support@sieve.test").
     original_message = _persist_source_message(db_session, caspian_message_id="msg-original-2")
     reply_message = persist_message(
         db_session,
         caspian_message_id="msg-reply-2",
         agent_id="internal",
         channel="email",
-        sender_handle="internal@sieve.test",
+        sender_handle="support@sieve.test",
         thread_id="conv-pending-2",
         raw_payload={},
     )
@@ -261,14 +271,55 @@ def test_reply_delivery_failure_leaves_request_pending(db_session):
 
     run_relay(
         llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
-        message_id=reply_message.id, agent_identity="support", channel="email",
-        sender_handle="internal@sieve.test", conversation_id="conv-pending-2",
+        message_id=reply_message.id, agent_identity="internal", channel="email",
+        sender_handle="support@sieve.test", conversation_id="conv-pending-2",
         subject=None, text="here's the answer",
     )
 
     relay_request = db_session.query(RelayRequest).one()
     assert relay_request.status == "pending"
     assert relay_request.completed_at is None
+
+
+def test_reply_correlation_mismatched_agent_identity_does_not_complete(db_session):
+    # Same target_conversation_id as a pending relay, but arriving on a
+    # DIFFERENT identity's connection than the one that sent the relay out
+    # (source_identity="internal", but this message's agent_identity is
+    # "careers"). This must not be treated as the awaited reply.
+    original_message = _persist_source_message(db_session, caspian_message_id="msg-original-3")
+    unrelated_message = persist_message(
+        db_session,
+        caspian_message_id="msg-unrelated-3",
+        agent_id="careers",
+        channel="email",
+        sender_handle="someone@sieve.test",
+        thread_id="conv-pending-3",
+        raw_payload={},
+    )
+    db_session.add(RelayRequest(
+        source_message_id=original_message.id,
+        source_identity="internal",
+        target_identity="support",
+        target_conversation_id="conv-pending-3",
+        message_text="need help",
+        status="pending",
+    ))
+    db_session.commit()
+
+    client = _FakeClient()
+    llm = _FakeLLM(RelayExtractionResult(is_relay_request=False))
+
+    run_relay(
+        llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
+        message_id=unrelated_message.id, agent_identity="careers", channel="email",
+        sender_handle="someone@sieve.test", conversation_id="conv-pending-3",
+        subject=None, text="unrelated message",
+    )
+
+    relay_request = db_session.query(RelayRequest).one()
+    assert relay_request.status == "pending"
+    assert relay_request.completed_at is None
+    assert client.reply_calls == []
 
 
 def test_relay_detection_llm_failure_is_soft_failed(db_session):
@@ -287,13 +338,19 @@ def test_relay_detection_llm_failure_is_soft_failed(db_session):
 
 
 def test_reply_correlation_delivers_reply_and_completes_request(db_session):
+    # The reply to a relay we sent out lands back on the SOURCE identity's
+    # own connection (see run_relay's docstring / Finding 1): send_relay()
+    # cold-starts the outbound conversation FROM the source identity's
+    # connection TO the target's address, so standard reply-threading
+    # routes the reply back to the source identity ("internal"), sent by
+    # whoever holds the target's own address ("support@sieve.test").
     original_message = _persist_source_message(db_session, caspian_message_id="msg-original")
     reply_message = persist_message(
         db_session,
         caspian_message_id="msg-reply",
         agent_id="internal",
         channel="email",
-        sender_handle="internal@sieve.test",
+        sender_handle="support@sieve.test",
         thread_id="conv-pending-1",
         raw_payload={},
     )
@@ -312,8 +369,8 @@ def test_reply_correlation_delivers_reply_and_completes_request(db_session):
 
     run_relay(
         llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
-        message_id=reply_message.id, agent_identity="support", channel="email",
-        sender_handle="internal@sieve.test", conversation_id="conv-pending-1",
+        message_id=reply_message.id, agent_identity="internal", channel="email",
+        sender_handle="support@sieve.test", conversation_id="conv-pending-1",
         subject=None, text="here's the answer",
     )
 
@@ -322,3 +379,66 @@ def test_reply_correlation_delivers_reply_and_completes_request(db_session):
     assert relay_request.completed_at is not None
     assert client.reply_calls == [("msg-original", "here's the answer")]
     assert client.initiate_calls == []
+
+
+def test_missing_identity_connection_replies_with_error_and_creates_no_relay_request(db_session):
+    message = _persist_source_message(db_session, caspian_message_id="msg-src-10")
+    llm = _FakeLLM(RelayExtractionResult(
+        is_relay_request=True, target_identity="support", message_text="need help",
+    ))
+    client = _FakeClient()
+    connections_missing_target = {
+        "internal": {"id": "conn-internal", "address": "internal@sieve.test"},
+        # "support" deliberately absent - simulates register_identities()
+        # not having a connection for the resolved target identity.
+    }
+
+    run_relay(
+        llm, client, db_session, connections_missing_target,
+        message_id=message.id, agent_identity="internal", channel="slack",
+        sender_handle="U-10", conversation_id="thread-1", subject=None, text="need help",
+    )
+
+    assert db_session.query(RelayRequest).count() == 0
+    assert client.initiate_calls == []
+    assert client.reply_calls == [("msg-src-10", DISPATCH_FAILURE_REPLY_TEXT)]
+
+
+def test_unexpected_error_is_swallowed_by_top_level_safety_net(db_session, monkeypatch):
+    message = _persist_source_message(db_session, caspian_message_id="msg-src-11")
+    llm = _FakeLLM(RelayExtractionResult(
+        is_relay_request=True, target_identity="support", message_text="need help",
+    ))
+    client = _FakeClient()
+
+    import app.relay.pipeline as pipeline_module
+
+    def failing_resolve_sender(db, *, channel, handle):
+        raise RuntimeError("unexpected failure")
+
+    monkeypatch.setattr(pipeline_module, "resolve_sender", failing_resolve_sender)
+
+    # Must not raise, per run_relay's "never raises" contract, even though
+    # this error occurs after the LLM call's own try/except and outside of
+    # _dispatch's try/except.
+    run_relay(
+        llm, client, db_session, IDENTITY_EMAIL_CONNECTIONS,
+        message_id=message.id, agent_identity="internal", channel="slack",
+        sender_handle="U-11", conversation_id="thread-1", subject=None, text="need help",
+    )
+
+    assert db_session.query(RelayRequest).count() == 0
+    assert client.initiate_calls == []
+
+
+def test_caspian_message_id_returns_none_for_missing_message(db_session):
+    assert _caspian_message_id(db_session, 999_999) is None
+
+
+def test_safe_deliver_reply_skips_and_returns_false_when_message_missing(db_session):
+    client = _FakeClient()
+
+    delivered = _safe_deliver_reply(client, db_session, 999_999, "hello")
+
+    assert delivered is False
+    assert client.reply_calls == []

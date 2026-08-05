@@ -41,7 +41,11 @@ def run_relay(
     """Runs off the ingest listen() loop, in its own DB session/thread (see
     app.ingest.handler._relay_and_record). Never raises: a relay-pipeline
     failure must not affect ingestion, which already completed successfully
-    before this was submitted.
+    before this was submitted. The entire body below is wrapped in a
+    top-level try/except as a final safety net, in addition to the more
+    targeted try/excepts around the LLM call and the dispatch call - this
+    guards against anything else in this path (e.g. a RelayRequest
+    IntegrityError on commit) escaping and taking down the ingest worker.
 
     `identity_email_connections` maps identity ("careers"/"support"/
     "internal") -> the email connection dict `register_identities()`
@@ -50,67 +54,94 @@ def run_relay(
     Built once in `app.ingest.worker.main()` and threaded down through the
     handler.
     """
-    if conversation_id is not None:
-        pending = db.execute(
-            select(RelayRequest).where(
-                RelayRequest.target_conversation_id == conversation_id,
-                RelayRequest.status == "pending",
-            )
-        ).scalar_one_or_none()
-        if pending is not None:
-            _deliver_pending_reply(client, db, pending, text or "")
+    try:
+        if conversation_id is not None:
+            # A reply to a relay we sent out lands back on the SOURCE
+            # identity's own connection (send_relay() cold-starts the
+            # outbound conversation FROM the source identity's connection
+            # TO the target identity's address, so standard reply-threading
+            # routes any reply back to the source identity, not the
+            # target). Matching on target_conversation_id alone isn't
+            # enough to rule out a coincidental collision on an unrelated
+            # identity's channel, so also require that this message arrived
+            # on the same identity that originally sent the relay out.
+            pending = db.execute(
+                select(RelayRequest).where(
+                    RelayRequest.target_conversation_id == conversation_id,
+                    RelayRequest.source_identity == agent_identity,
+                    RelayRequest.status == "pending",
+                )
+            ).scalar_one_or_none()
+            if pending is not None:
+                _deliver_pending_reply(client, db, pending, text or "")
+                return
+
+        try:
+            prompt = _build_relay_prompt(subject=subject, text=text)
+            result = relay_llm.invoke(prompt)
+        except Exception:
+            logger.exception("Relay-detection LLM call failed for message %s", message_id)
             return
 
-    try:
-        prompt = _build_relay_prompt(subject=subject, text=text)
-        result = relay_llm.invoke(prompt)
+        if not result.is_relay_request or result.target_identity not in VALID_TARGET_IDENTITIES:
+            return
+
+        message_text = result.message_text or text or ""
+        target_identity = result.target_identity
+        person = resolve_sender(db, channel=channel, handle=sender_handle)
+
+        if target_identity != "support" and not person.verified_employee:
+            employee = None
+            if result.claims_employee and result.employment_id:
+                try:
+                    employee = verify_employment_id(db, result.employment_id)
+                except Exception:
+                    logger.exception(
+                        "Employment ID lookup failed for message %s; treating as unverified",
+                        message_id,
+                    )
+                    employee = None
+            if employee is not None:
+                person.verified_employee = True
+                db.commit()
+            else:
+                _safe_deliver_reply(client, db, message_id, UNVERIFIED_REPLY_TEXT)
+                target_identity = "support"
+
+        _dispatch(
+            client,
+            db,
+            identity_email_connections,
+            message_id=message_id,
+            agent_identity=agent_identity,
+            target_identity=target_identity,
+            message_text=message_text,
+        )
     except Exception:
-        logger.exception("Relay-detection LLM call failed for message %s", message_id)
-        return
-
-    if not result.is_relay_request or result.target_identity not in VALID_TARGET_IDENTITIES:
-        return
-
-    message_text = result.message_text or text or ""
-    target_identity = result.target_identity
-    person = resolve_sender(db, channel=channel, handle=sender_handle)
-
-    if target_identity != "support" and not person.verified_employee:
-        employee = None
-        if result.claims_employee and result.employment_id:
-            try:
-                employee = verify_employment_id(db, result.employment_id)
-            except Exception:
-                logger.exception(
-                    "Employment ID lookup failed for message %s; treating as unverified",
-                    message_id,
-                )
-                employee = None
-        if employee is not None:
-            person.verified_employee = True
-            db.commit()
-        else:
-            deliver_reply(
-                client,
-                caspian_message_id=_caspian_message_id(db, message_id),
-                text=UNVERIFIED_REPLY_TEXT,
-            )
-            target_identity = "support"
-
-    _dispatch(
-        client,
-        db,
-        identity_email_connections,
-        message_id=message_id,
-        agent_identity=agent_identity,
-        target_identity=target_identity,
-        message_text=message_text,
-    )
+        logger.exception("Unhandled error in run_relay for message %s", message_id)
 
 
-def _caspian_message_id(db: Session, message_id: int) -> str:
+def _caspian_message_id(db: Session, message_id: int) -> str | None:
     message = db.get(Message, message_id)
-    return message.caspian_message_id
+    return message.caspian_message_id if message is not None else None
+
+
+def _safe_deliver_reply(client: Any, db: Session, message_id: int, text: str) -> bool:
+    """Delivers a reply, catching and logging any failure - missing source
+    message or a dispatcher/client exception - instead of raising. Returns
+    True if the reply was actually delivered."""
+    caspian_message_id = _caspian_message_id(db, message_id)
+    if caspian_message_id is None:
+        logger.warning(
+            "Cannot deliver reply for message %s: source message not found", message_id
+        )
+        return False
+    try:
+        deliver_reply(client, caspian_message_id=caspian_message_id, text=text)
+    except Exception:
+        logger.exception("Failed to deliver reply for message %s", message_id)
+        return False
+    return True
 
 
 def _dispatch(
@@ -133,6 +164,7 @@ def _dispatch(
             agent_identity,
             target_identity,
         )
+        _safe_deliver_reply(client, db, message_id, DISPATCH_FAILURE_REPLY_TEXT)
         return
 
     try:
@@ -145,11 +177,7 @@ def _dispatch(
         )
     except Exception:
         logger.exception("Failed to dispatch relay for message %s", message_id)
-        deliver_reply(
-            client,
-            caspian_message_id=_caspian_message_id(db, message_id),
-            text=DISPATCH_FAILURE_REPLY_TEXT,
-        )
+        _safe_deliver_reply(client, db, message_id, DISPATCH_FAILURE_REPLY_TEXT)
         return
 
     db.add(
@@ -168,15 +196,10 @@ def _dispatch(
 def _deliver_pending_reply(
     client: Any, db: Session, pending: RelayRequest, reply_text: str
 ) -> None:
-    try:
-        deliver_reply(
-            client,
-            caspian_message_id=_caspian_message_id(db, pending.source_message_id),
-            text=reply_text,
-        )
-    except Exception:
-        logger.exception(
-            "Failed to deliver reply for relay_request %s; leaving pending", pending.id
+    delivered = _safe_deliver_reply(client, db, pending.source_message_id, reply_text)
+    if not delivered:
+        logger.info(
+            "Leaving relay_request %s pending; reply delivery failed", pending.id
         )
         return
     pending.status = "completed"
