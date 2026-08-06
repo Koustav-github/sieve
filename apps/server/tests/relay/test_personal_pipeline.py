@@ -5,7 +5,11 @@ from app.models.pending_verification import PendingVerification
 from app.models.person import PersonEntity
 from app.models.platform_connection import PlatformConnection
 from app.models.relay_request import RelayRequest
-from app.relay.personal_pipeline import run_personal_relay
+from app.relay.personal_pipeline import (
+    _build_personal_prompt,
+    _upsert_pending_verification,
+    run_personal_relay,
+)
 from app.relay.schemas import RelayExtractionResult
 
 RELAY_SENDER_CONNECTION_ID = "conn-relay-sender"
@@ -35,9 +39,13 @@ class _FakeClient:
 
 
 def _make_department(db_session, *, team_name, requires_verification=True):
-    platform_connection = PlatformConnection(platform="slack", connection_id="conn-dept-1")
-    db_session.add(platform_connection)
-    db_session.flush()
+    platform_connection = (
+        db_session.query(PlatformConnection).filter_by(platform="slack").one_or_none()
+    )
+    if platform_connection is None:
+        platform_connection = PlatformConnection(platform="slack", connection_id="conn-dept-1")
+        db_session.add(platform_connection)
+        db_session.flush()
     department = Department(
         team_name=team_name, lead_name="Lead", lead_email=f"{team_name}@company.com",
         platform_connection_id=platform_connection.id, channel_ref=f"chan-{team_name}",
@@ -110,7 +118,7 @@ def test_id_given_upfront_verifies_and_dispatches_immediately(db_session):
 def test_followup_message_with_valid_id_resumes_held_query(db_session):
     department = _make_department(db_session, team_name="finance")
     db_session.add(Employee(employment_id="EMP-2", name="Bob"))
-    original = _persist_message(db_session, caspian_message_id="msg-original", sender_handle="U-3")
+    _persist_message(db_session, caspian_message_id="msg-original", sender_handle="U-3")
     db_session.add(PendingVerification(
         sender_handle="U-3", channel="slack",
         target_department_id=department.id, message_text="Q1 numbers please",
@@ -128,7 +136,7 @@ def test_followup_message_with_valid_id_resumes_held_query(db_session):
 
 def test_followup_message_with_invalid_id_drops_pending_and_replies(db_session):
     department = _make_department(db_session, team_name="finance")
-    original = _persist_message(db_session, caspian_message_id="msg-original-2", sender_handle="U-4")
+    _persist_message(db_session, caspian_message_id="msg-original-2", sender_handle="U-4")
     db_session.add(PendingVerification(
         sender_handle="U-4", channel="slack",
         target_department_id=department.id, message_text="Q1 numbers please",
@@ -164,7 +172,7 @@ def test_new_query_replaces_older_pending_verification(db_session):
 
 
 def test_already_verified_employee_skips_reasking(db_session):
-    department = _make_department(db_session, team_name="finance")
+    _make_department(db_session, team_name="finance")
     from app.models.channel_handle import ChannelHandle
     person = PersonEntity(display_name=None, is_provisional=True, verified_employee=True)
     db_session.add(person)
@@ -261,6 +269,164 @@ def test_followup_message_without_any_id_keeps_pending_and_reasks(db_session):
     assert len(client.reply_calls) == 1
     pending = db_session.query(PendingVerification).one()
     assert pending.message_text == "Q1 numbers please"
+
+
+def test_dispatch_failure_replies_with_error_and_records_no_relay_request(db_session):
+    _make_department(db_session, team_name="finance")
+    message = _persist_message(db_session)
+    llm = _FakeLLM(RelayExtractionResult(is_relay_request=True, target_identity="finance", message_text="Q1 numbers please", claims_employee=False, employment_id=None))
+
+    class _FailingClient(_FakeClient):
+        def initiate(self, connection_id, recipient, text):
+            raise RuntimeError("gateway unreachable")
+
+    client = _FailingClient()
+
+    run_personal_relay(llm, client, db_session, connection_id=RELAY_SENDER_CONNECTION_ID, message_id=message.id, channel="slack", sender_handle="U-1", conversation_id=None, subject=None, text="ask finance for Q1 numbers")
+
+    assert len(client.reply_calls) == 1
+    assert client.reply_calls[0][0] == "msg-1"
+    assert db_session.query(RelayRequest).count() == 0
+
+
+def test_lead_email_missing_at_sign_fails_dispatch_without_calling_client(db_session):
+    _make_department(db_session, team_name="customercare", requires_verification=False)
+    department = db_session.query(Department).filter_by(team_name="customercare").one()
+    department.lead_email = "not-an-email"
+    db_session.commit()
+    message = _persist_message(db_session)
+    llm = _FakeLLM(RelayExtractionResult(is_relay_request=True, target_identity="customercare", message_text="need help"))
+    client = _FakeClient()
+
+    run_personal_relay(llm, client, db_session, connection_id=RELAY_SENDER_CONNECTION_ID, message_id=message.id, channel="slack", sender_handle="U-1", conversation_id=None, subject=None, text="need help")
+
+    assert client.initiate_calls == []
+    assert len(client.reply_calls) == 1
+
+
+def test_correlation_miss_on_relay_sender_connection_is_not_treated_as_new_request(db_session):
+    """A message arriving on the shared relay-sender connection with a
+    conversation_id that matches no pending RelayRequest is stray traffic on
+    our own outbound channel (e.g. Caspian didn't assign the conversation_id
+    we expected), not a genuine new personal-chat request. Treating it as
+    one would risk relaying a lead's quoted-reply text onward and asking
+    them for an employee ID."""
+    message = _persist_message(db_session, sender_handle="lead-address")
+
+    class _RaisingLLM:
+        def invoke(self, prompt):
+            raise AssertionError("LLM must not be invoked when correlation misses on the relay-sender connection")
+
+    client = _FakeClient()
+
+    run_personal_relay(
+        _RaisingLLM(), client, db_session, connection_id=RELAY_SENDER_CONNECTION_ID,
+        message_id=message.id, channel="slack", sender_handle="lead-address",
+        conversation_id="conv-no-match", subject=None, text="some stray reply text",
+        arrived_on_relay_sender_connection=True,
+    )
+
+    assert client.initiate_calls == []
+    assert client.reply_calls == []
+    assert db_session.query(PendingVerification).count() == 0
+
+
+def test_correlation_miss_on_a_different_connection_still_falls_through_to_normal_handling(db_session):
+    """The stop-on-miss guard only applies when the message itself arrived
+    on the relay-sender connection - a genuine personal-DM on some other
+    platform connection that happens to carry a non-matching conversation_id
+    must still be processed normally."""
+    _make_department(db_session, team_name="customercare", requires_verification=False)
+    message = _persist_message(db_session)
+    llm = _FakeLLM(RelayExtractionResult(is_relay_request=True, target_identity="customercare", message_text="need help"))
+    client = _FakeClient()
+
+    run_personal_relay(
+        llm, client, db_session, connection_id=RELAY_SENDER_CONNECTION_ID,
+        message_id=message.id, channel="slack", sender_handle="U-1",
+        conversation_id="conv-not-a-relay-reply", subject=None, text="need help",
+        arrived_on_relay_sender_connection=False,
+    )
+
+    assert client.initiate_calls == [(RELAY_SENDER_CONNECTION_ID, "customercare@company.com", "need help")]
+
+
+def test_build_personal_prompt_includes_pending_context_when_a_query_is_held(db_session):
+    """Regression test: without pending context, a bare ID-only reply like
+    "EMP-2" is analyzed by the same generic prompt used for a fresh request,
+    risking a hallucinated target_identity that discards the held query
+    (see _resolve_pending_with_result's names_fresh_target check)."""
+    department = _make_department(db_session, team_name="finance")
+    pending = PendingVerification(
+        sender_handle="U-1", channel="slack",
+        target_department_id=department.id, message_text="Q1 numbers please",
+    )
+    db_session.add(pending)
+    db_session.commit()
+
+    prompt = _build_personal_prompt(subject=None, text="EMP-2", pending=pending)
+
+    assert "finance" in prompt
+    assert "Q1 numbers please" in prompt
+    assert "employee ID" in prompt
+
+    prompt_without_pending = _build_personal_prompt(subject=None, text="EMP-2", pending=None)
+    assert "Q1 numbers please" not in prompt_without_pending
+
+
+def test_upsert_pending_verification_updates_existing_row_on_conflict(db_session):
+    """Simulates the losing side of a concurrent-insert race: a row for
+    (sender_handle, channel) already exists when _upsert_pending_verification
+    is called, so the plain insert it attempts first must hit the unique
+    constraint and fall back to an update rather than propagating the
+    IntegrityError (which the caller's top-level except would otherwise
+    swallow silently, leaving that sender's message unanswered)."""
+    department = _make_department(db_session, team_name="finance")
+    other_department = _make_department(db_session, team_name="hr")
+    db_session.add(PendingVerification(
+        sender_handle="U-1", channel="slack",
+        target_department_id=department.id, message_text="old question",
+    ))
+    db_session.commit()
+
+    _upsert_pending_verification(
+        db_session, sender_handle="U-1", channel="slack",
+        target_department_id=other_department.id, message_text="new question",
+    )
+
+    pending = db_session.query(PendingVerification).one()
+    assert pending.message_text == "new question"
+    assert pending.target_department_id == other_department.id
+
+
+def test_duplicate_target_conversation_id_does_not_falsely_report_failure(db_session):
+    """Critical fix regression test: if Caspian assigns the send an already-
+    in-use conversation_id (e.g. two relays to the same lead collapse onto
+    one mailbox thread), the email has ALREADY gone out by the time the
+    RelayRequest insert conflicts. The requester must not be told the relay
+    failed - it didn't - and the original pending RelayRequest must survive
+    untouched rather than being silently overwritten or lost."""
+    _make_department(db_session, team_name="finance", requires_verification=False)
+    earlier_message = _persist_message(db_session, caspian_message_id="msg-earlier", sender_handle="U-earlier")
+    db_session.add(RelayRequest(
+        source_message_id=earlier_message.id, source_identity="personal",
+        target_identity="finance", target_conversation_id="conv-dup",
+        message_text="earlier question", status="pending",
+    ))
+    db_session.commit()
+
+    message = _persist_message(db_session, caspian_message_id="msg-new", sender_handle="U-new")
+    llm = _FakeLLM(RelayExtractionResult(is_relay_request=True, target_identity="finance", message_text="new question", claims_employee=False, employment_id=None))
+    client = _FakeClient(initiate_response={"conversation_id": "conv-dup"})
+
+    run_personal_relay(llm, client, db_session, connection_id=RELAY_SENDER_CONNECTION_ID, message_id=message.id, channel="slack", sender_handle="U-new", conversation_id=None, subject=None, text="ask finance a new question")
+
+    assert client.initiate_calls == [(RELAY_SENDER_CONNECTION_ID, "finance@company.com", "new question")]
+    assert client.reply_calls == []  # no false "couldn't relay" message - it was sent
+
+    relay_requests = db_session.query(RelayRequest).all()
+    assert len(relay_requests) == 1
+    assert relay_requests[0].message_text == "earlier question"  # untouched
 
 
 def test_reply_correlation_delivers_reply_to_original_message_and_completes_pending(db_session):

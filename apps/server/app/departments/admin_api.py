@@ -1,16 +1,38 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import get_db
+from app.departments.registry import get_exempt_department
 from app.models.department import Department
 from app.models.platform_connection import PlatformConnection
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/admin/departments", tags=["admin"])
+_admin_api_key_header = APIKeyHeader(name="X-Admin-Api-Key", auto_error=False)
+
+
+def _require_admin_api_key(api_key: str | None = Security(_admin_api_key_header)) -> None:
+    """Fails closed: an unset admin_api_key blocks every request rather than
+    leaving the endpoint open, matching this codebase's existing fail-fast
+    pattern for missing secrets (see app.ingest.worker.main's
+    ANTHROPIC_API_KEY check). Without this, anyone reaching the API could
+    register a department with an attacker-controlled lead_email and have
+    real employee messages emailed to them."""
+    if not settings.admin_api_key:
+        raise HTTPException(status_code=503, detail="Admin API is not configured")
+    if api_key != settings.admin_api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing admin API key")
+
+
+router = APIRouter(
+    prefix="/admin/departments", tags=["admin"], dependencies=[Depends(_require_admin_api_key)]
+)
 
 # Maps a platform name to the CommClient method that installs/connects it.
 # Only "slack" uses the one-click install_*() flow today. Discord's real
@@ -29,6 +51,7 @@ class DepartmentCreateRequest(BaseModel):
     lead_email: str
     platform: str
     channel_name: str
+    requires_verification: bool = True
 
 
 class DepartmentResponse(BaseModel):
@@ -47,6 +70,17 @@ class ChannelResolutionError(ValueError):
     conversation counts, which are useful for server-side logs and direct
     callers/tests of `provision_department` but must NOT be echoed to HTTP
     callers - see `create_department`'s exception handling below."""
+
+
+class DuplicateDepartmentError(ValueError):
+    """Raised when a new department would violate a uniqueness rule this
+    codebase depends on for correctness: a duplicate team_name, a
+    (platform_connection_id, channel_ref) pair another department already
+    owns (which would make match_group_message() raise MultipleResultsFound
+    and silently drop every message on that channel), or a second
+    requires_verification=False department (which would make
+    get_exempt_department() raise instead of returning a usable fallback).
+    Safe to echo to HTTP callers - carries no internal connection details."""
 
 
 def _normalize_channel_name(name: str) -> str:
@@ -112,12 +146,19 @@ def provision_department(
     lead_email: str,
     platform: str,
     channel_name: str,
+    requires_verification: bool = True,
 ) -> Department:
     """Registers a department, provisioning a new platform_connections row
     (live Caspian call) only if this platform has no connection yet -
     departments on an already-connected platform reuse the existing row.
     Rolls back on any failure so a half-created department/connection never
     persists."""
+    if not requires_verification and get_exempt_department(db) is not None:
+        raise DuplicateDepartmentError(
+            "A department with requires_verification=False already exists - "
+            "only one exempt department is allowed at a time"
+        )
+
     platform_connection = (
         db.query(PlatformConnection).filter_by(platform=platform).one_or_none()
     )
@@ -136,9 +177,16 @@ def provision_department(
             lead_email=lead_email,
             platform_connection_id=platform_connection.id,
             channel_ref=channel_ref,
+            requires_verification=requires_verification,
         )
         db.add(department)
         db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise DuplicateDepartmentError(
+            f"team_name {team_name!r} is already registered, or another "
+            "department already owns this channel"
+        ) from exc
     except Exception:
         db.rollback()
         raise
@@ -147,7 +195,7 @@ def provision_department(
 
 @router.post("", response_model=DepartmentResponse)
 def create_department(
-    payload: DepartmentCreateRequest, db: Session = Depends(get_db)
+    payload: DepartmentCreateRequest, db: Session = Depends(get_db)  # noqa: B008
 ) -> DepartmentResponse:
     from caspian_sdk import CommClient
 
@@ -158,6 +206,7 @@ def create_department(
             team_name=payload.team_name, lead_name=payload.lead_name,
             lead_email=payload.lead_email, platform=payload.platform,
             channel_name=payload.channel_name,
+            requires_verification=payload.requires_verification,
         )
     except ChannelResolutionError as exc:
         # The precise message (connection_id, visible-conversation counts,
@@ -168,6 +217,8 @@ def create_department(
         raise HTTPException(
             status_code=400, detail="Channel not found or bot not invited to it"
         ) from exc
+    except DuplicateDepartmentError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         # Other ValueErrors (e.g. an unsupported platform) don't carry
         # sensitive internal details, so it's safe to pass them through.

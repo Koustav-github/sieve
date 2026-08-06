@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     discord_bot_token: str = ""
     anthropic_api_key: str = ""
+    admin_api_key: str = ""
 
 
 settings = Settings()

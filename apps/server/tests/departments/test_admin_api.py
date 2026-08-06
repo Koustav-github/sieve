@@ -1,10 +1,15 @@
 import pytest
+from fastapi.testclient import TestClient
 
+from app.core.config import settings
+from app.db.session import get_db
 from app.departments.admin_api import (
     ChannelResolutionError,
+    DuplicateDepartmentError,
     _install_platform_connection,
     provision_department,
 )
+from app.main import app
 from app.models.department import Department
 from app.models.platform_connection import PlatformConnection
 
@@ -131,6 +136,175 @@ def test_resolve_channel_ref_rejects_substring_only_match(db_session):
             team_name="finance", lead_name="Alice", lead_email="alice@company.com",
             platform="slack", channel_name="finance",
         )
+
+
+def test_provision_department_rejects_duplicate_team_name(db_session):
+    client = _FakeClient()
+    provision_department(
+        db_session, client,
+        team_name="finance", lead_name="Alice", lead_email="alice@company.com",
+        platform="slack", channel_name="finance-team",
+    )
+
+    with pytest.raises(DuplicateDepartmentError):
+        provision_department(
+            db_session, client,
+            team_name="finance", lead_name="Bob", lead_email="bob@company.com",
+            platform="slack", channel_name="finance-team",
+        )
+
+
+def test_provision_department_rejects_duplicate_channel_ref(db_session):
+    """Two departments resolving to the same (platform_connection, channel)
+    would make app.departments.registry.match_group_message() raise
+    MultipleResultsFound - which the ingest handler doesn't catch, silently
+    dropping every message on that channel. Must be rejected at write time."""
+    client = _FakeClient(conversations=[{"id": "chan-shared", "name": "shared-team"}])
+    provision_department(
+        db_session, client,
+        team_name="finance", lead_name="Alice", lead_email="alice@company.com",
+        platform="slack", channel_name="shared-team",
+    )
+
+    with pytest.raises(DuplicateDepartmentError):
+        provision_department(
+            db_session, client,
+            team_name="finance-backup", lead_name="Bob", lead_email="bob@company.com",
+            platform="slack", channel_name="shared-team",
+        )
+
+
+def test_provision_department_rejects_second_exempt_department(db_session):
+    client = _FakeClient(conversations=[{"id": "chan-cc", "name": "cc-team"}])
+    provision_department(
+        db_session, client,
+        team_name="customercare", lead_name="Alice", lead_email="alice@company.com",
+        platform="slack", channel_name="cc-team", requires_verification=False,
+    )
+    client2 = _FakeClient(conversations=[{"id": "chan-support", "name": "support-team"}])
+
+    with pytest.raises(DuplicateDepartmentError, match="already exists"):
+        provision_department(
+            db_session, client2,
+            team_name="support", lead_name="Bob", lead_email="bob@company.com",
+            platform="slack", channel_name="support-team", requires_verification=False,
+        )
+
+
+@pytest.fixture()
+def http_client(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "admin_api_key", "test-admin-key")
+
+    def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    yield TestClient(app)
+    app.dependency_overrides.pop(get_db, None)
+
+
+def test_create_department_rejects_missing_api_key(http_client):
+    response = http_client.post(
+        "/admin/departments",
+        json={
+            "team_name": "finance", "lead_name": "Alice", "lead_email": "alice@company.com",
+            "platform": "slack", "channel_name": "finance-team",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_create_department_rejects_wrong_api_key(http_client):
+    response = http_client.post(
+        "/admin/departments",
+        json={
+            "team_name": "finance", "lead_name": "Alice", "lead_email": "alice@company.com",
+            "platform": "slack", "channel_name": "finance-team",
+        },
+        headers={"X-Admin-Api-Key": "wrong-key"},
+    )
+    assert response.status_code == 401
+
+
+def test_create_department_rejects_all_requests_when_admin_api_key_unset(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "admin_api_key", "")
+
+    def _override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        response = TestClient(app).post(
+            "/admin/departments",
+            json={
+                "team_name": "finance", "lead_name": "Alice", "lead_email": "alice@company.com",
+                "platform": "slack", "channel_name": "finance-team",
+            },
+            headers={"X-Admin-Api-Key": "anything"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+    assert response.status_code == 503
+
+
+def test_create_department_succeeds_with_valid_key(http_client, monkeypatch):
+    monkeypatch.setattr(
+        "caspian_sdk.CommClient",
+        lambda: _FakeClient(conversations=[{"id": "chan-1", "name": "finance-team"}]),
+    )
+
+    response = http_client.post(
+        "/admin/departments",
+        json={
+            "team_name": "finance", "lead_name": "Alice", "lead_email": "alice@company.com",
+            "platform": "slack", "channel_name": "finance-team",
+        },
+        headers={"X-Admin-Api-Key": "test-admin-key"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["team_name"] == "finance"
+    assert body["channel_ref"] == "chan-1"
+    assert body["requires_verification"] is True
+
+
+def test_create_department_maps_duplicate_team_name_to_409(http_client, monkeypatch):
+    monkeypatch.setattr(
+        "caspian_sdk.CommClient",
+        lambda: _FakeClient(conversations=[{"id": "chan-1", "name": "finance-team"}]),
+    )
+    payload = {
+        "team_name": "finance", "lead_name": "Alice", "lead_email": "alice@company.com",
+        "platform": "slack", "channel_name": "finance-team",
+    }
+    first = http_client.post(
+        "/admin/departments", json=payload, headers={"X-Admin-Api-Key": "test-admin-key"}
+    )
+    assert first.status_code == 200
+
+    second = http_client.post(
+        "/admin/departments", json=payload, headers={"X-Admin-Api-Key": "test-admin-key"}
+    )
+    assert second.status_code == 409
+
+
+def test_create_department_maps_channel_resolution_error_to_400_without_leaking_details(
+    http_client, monkeypatch
+):
+    monkeypatch.setattr("caspian_sdk.CommClient", lambda: _FakeClient(conversations=[]))
+
+    response = http_client.post(
+        "/admin/departments",
+        json={
+            "team_name": "finance", "lead_name": "Alice", "lead_email": "alice@company.com",
+            "platform": "slack", "channel_name": "finance-team",
+        },
+        headers={"X-Admin-Api-Key": "test-admin-key"},
+    )
+
+    assert response.status_code == 400
+    assert "conn-" not in response.text
 
 
 def test_resolve_channel_ref_raises_when_two_conversations_share_exact_name(db_session):
