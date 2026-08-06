@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -12,8 +12,20 @@ RELAY_STATUSES = ("pending", "completed")
 class RelayRequest(Base):
     __tablename__ = "relay_requests"
     __table_args__ = (
-        UniqueConstraint(
-            "target_conversation_id", name="uq_relay_requests_target_conversation_id"
+        # Partial (not table-wide) unique index: only one *pending* relay may
+        # own a given target_conversation_id at a time. A table-wide unique
+        # constraint would let one completed relay to a lead permanently
+        # block every future relay to that same conversation - and worse,
+        # would force a real duplicate-conversation-id send (Caspian's
+        # shared-mailbox risk, see dispatcher.py) to silently fail the DB
+        # insert *after* the email already went out, misrouting the lead's
+        # eventual reply to whichever RelayRequest happened to win the race.
+        Index(
+            "uq_relay_requests_pending_target_conversation_id",
+            "target_conversation_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+            sqlite_where=text("status = 'pending'"),
         ),
     )
 

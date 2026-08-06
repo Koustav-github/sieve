@@ -52,14 +52,14 @@ SYNC_EXECUTOR = _SyncExecutor()
 
 
 def _fake_message(**overrides):
-    defaults = dict(
-        id="msg-100",
-        channel="slack",
-        connection_id="conn-personal-1",
-        conversation_id=None,
-        sender={"address": "U-1"},
-        text="Hello",
-    )
+    defaults = {
+        "id": "msg-100",
+        "channel": "slack",
+        "connection_id": "conn-personal-1",
+        "conversation_id": None,
+        "sender": {"address": "U-1"},
+        "text": "Hello",
+    }
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
 
@@ -177,6 +177,33 @@ def test_group_chat_message_stamps_department_team_name(session_factory, db_sess
     try:
         message = db.query(Message).filter_by(caspian_message_id="msg-200").one()
         assert message.agent_id == "finance"
+    finally:
+        db.close()
+
+
+def test_department_registered_after_handler_build_is_immediately_routable(session_factory, db_session):
+    """Proves no worker restart is needed: unlike v1's fixed connection_id ->
+    identity map built once at startup, classify_scope() resolves group-chat
+    membership from the live departments table per message - so a department
+    registered after build_on_message_handler() was already called must
+    still be routable on the very next message."""
+    handle = _build_handler(session_factory)
+
+    platform_connection = PlatformConnection(platform="slack", connection_id="conn-hr-1")
+    db_session.add(platform_connection)
+    db_session.flush()
+    db_session.add(Department(
+        team_name="hr", lead_name="Lead", lead_email="hr@company.com",
+        platform_connection_id=platform_connection.id, channel_ref="chan-hr",
+    ))
+    db_session.commit()
+
+    handle(_fake_message(id="msg-202", connection_id="conn-hr-1", conversation_id="chan-hr"))
+
+    db = session_factory()
+    try:
+        message = db.query(Message).filter_by(caspian_message_id="msg-202").one()
+        assert message.agent_id == "hr"
     finally:
         db.close()
 

@@ -79,6 +79,7 @@ def _relay_and_record(
                 connection_id=relay_sender_connection_id,
                 message_id=message_id, channel=channel, sender_handle=sender_handle,
                 conversation_id=channel_ref,
+                arrived_on_relay_sender_connection=(connection_id == relay_sender_connection_id),
                 subject=subject, text=text,
             )
     except Exception:
@@ -139,7 +140,7 @@ def build_on_message_handler(
                 )
                 return
 
-            scope, department = classify_scope(db, connection_id=connection_id, channel_ref=channel_ref)
+            _, department = classify_scope(db, connection_id=connection_id, channel_ref=channel_ref)
             agent_id = department.team_name if department is not None else "personal"
 
             resolve_sender(db, channel=channel, handle=sender_handle)

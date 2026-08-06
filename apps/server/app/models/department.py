@@ -9,7 +9,17 @@ from app.models.platform_connection import PlatformConnection
 
 class Department(Base):
     __tablename__ = "departments"
-    __table_args__ = (UniqueConstraint("team_name", name="uq_departments_team_name"),)
+    __table_args__ = (
+        UniqueConstraint("team_name", name="uq_departments_team_name"),
+        # Prevents two departments from resolving to the same channel: an
+        # admin mistake here would otherwise make match_group_message()
+        # raise MultipleResultsFound inside the ingest handler's try block,
+        # silently dropping every message on that channel (never persisted).
+        UniqueConstraint(
+            "platform_connection_id", "channel_ref",
+            name="uq_departments_platform_connection_channel_ref",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     team_name: Mapped[str] = mapped_column(String, nullable=False)
